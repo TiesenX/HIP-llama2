@@ -89,25 +89,71 @@ typedef struct {
 } Transformer;
 
 
+// void malloc_run_state(RunState* s, Config* p) {
+//   // we calloc instead of malloc to keep valgrind happy
+//   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+//   s->x = (float*)calloc(p->dim, sizeof(float));
+//   s->xb = (float*)calloc(p->dim, sizeof(float));
+//   s->xb2 = (float*)calloc(p->dim, sizeof(float));
+//   s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
+//   s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
+//   s->q = (float*)calloc(p->dim, sizeof(float));
+//   s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+//   s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+//   s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
+//   s->logits = (float*)calloc(p->vocab_size, sizeof(float));
+//   // ensure all mallocs went fine
+//   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+//       || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+//     fprintf(stderr, "malloc failed!\n");
+//     exit(EXIT_FAILURE);
+//   }
+// }
+
+// void free_run_state(RunState* s) {
+//   free(s->x);
+//   free(s->xb);
+//   free(s->xb2);
+//   free(s->hb);
+//   free(s->hb2);
+//   free(s->q);
+//   free(s->att);
+//   free(s->logits);
+//   free(s->key_cache);
+//   free(s->value_cache);
+// }
+
 void malloc_run_state(RunState* s, Config* p) {
   // we calloc instead of malloc to keep valgrind happy
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = (float*)calloc(p->dim, sizeof(float));
-  s->xb = (float*)calloc(p->dim, sizeof(float));
-  s->xb2 = (float*)calloc(p->dim, sizeof(float));
-  s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
-  s->q = (float*)calloc(p->dim, sizeof(float));
-  s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
-  s->logits = (float*)calloc(p->vocab_size, sizeof(float));
-  // ensure all mallocs went fine
+  CHECK_HIP(hipHostMalloc(&s->x, p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->xb, p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->xb2, p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->hb, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->hb2, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->q, p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->att, p->n_heads * p->seq_len * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipHostMalloc(&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
       || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
   }
+}
+
+void free_run_state(RunState* s) {
+  CHECK_HIP(hipHostFree(s->x));
+  CHECK_HIP(hipHostFree(s->xb));
+  CHECK_HIP(hipHostFree(s->xb2));
+  CHECK_HIP(hipHostFree(s->hb));
+  CHECK_HIP(hipHostFree(s->hb2));
+  CHECK_HIP(hipHostFree(s->q));
+  CHECK_HIP(hipHostFree(s->att));
+  CHECK_HIP(hipHostFree(s->logits));
+  CHECK_HIP(hipHostFree(s->key_cache));
+  CHECK_HIP(hipHostFree(s->value_cache));
 }
 
 // void malloc_run_state(RunState* s, Config* p) { // GPU
@@ -133,20 +179,6 @@ void malloc_run_state(RunState* s, Config* p) {
 //   }
 
 // }
-
-void free_run_state(RunState* s) {
-  free(s->x);
-  free(s->xb);
-  free(s->xb2);
-  free(s->hb);
-  free(s->hb2);
-  free(s->q);
-  free(s->att);
-  free(s->logits);
-  free(s->key_cache);
-  free(s->value_cache);
-}
-
 
 // void free_run_state(RunState* s) { // GPU
 //   CHECK_HIP(hipFree(s->x));
@@ -252,6 +284,65 @@ void device_memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int
   }
 }
 
+void pinned_memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+  int head_size = p->dim / p->n_heads;
+  unsigned long long n_layers = p->n_layers;
+  
+  CHECK_HIP(hipHostMalloc(&w->token_embedding_table, p->vocab_size * p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->token_embedding_table, ptr, p->vocab_size * p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += p->vocab_size * p->dim;
+
+  CHECK_HIP(hipHostMalloc(&w->rms_att_weight, n_layers * p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->rms_att_weight, ptr, n_layers * p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim;
+
+  CHECK_HIP(hipHostMalloc(&w->wq, n_layers * p->dim * (p->n_heads * head_size) * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->wq, ptr, n_layers * p->dim * (p->n_heads * head_size) * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim * (p->n_heads * head_size);
+
+  CHECK_HIP(hipHostMalloc(&w->wk, n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->wk, ptr, n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+
+  CHECK_HIP(hipHostMalloc(&w->wv, n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->wv, ptr, n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+
+  CHECK_HIP(hipHostMalloc(&w->wo, n_layers * (p->n_heads * head_size) * p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->wo, ptr, n_layers * (p->n_heads * head_size) * p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * (p->n_heads * head_size) * p->dim;
+
+  CHECK_HIP(hipHostMalloc(&w->rms_ffn_weight, n_layers * p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->rms_ffn_weight, ptr, n_layers * p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim;
+
+  CHECK_HIP(hipHostMalloc(&w->w1, n_layers * p->dim * p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->w1, ptr, n_layers * p->dim * p->hidden_dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim * p->hidden_dim;
+
+  CHECK_HIP(hipHostMalloc(&w->w2, n_layers * p->hidden_dim * p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->w2, ptr, n_layers * p->hidden_dim * p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->hidden_dim * p->dim;
+
+  CHECK_HIP(hipHostMalloc(&w->w3, n_layers * p->dim * p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->w3, ptr, n_layers * p->dim * p->hidden_dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += n_layers * p->dim * p->hidden_dim;
+
+  CHECK_HIP(hipHostMalloc(&w->rms_final_weight, p->dim * sizeof(float), hipMemAllocationTypePinned));
+  CHECK_HIP(hipMemcpy(w->rms_final_weight, ptr, p->dim * sizeof(float), hipMemcpyHostToHost));
+  ptr += p->dim;
+
+  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+
+  if (shared_weights) {
+    w->wcls = w->token_embedding_table;
+  } else {
+    CHECK_HIP(hipHostMalloc(&w->wcls, p->dim * p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipMemcpy(w->wcls, ptr, p->dim * p->vocab_size * sizeof(float), hipMemcpyHostToHost));
+  }
+}
+
 
 void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
     int* fd, float** data, ssize_t* file_size) {
@@ -272,8 +363,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
   *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
   float* weights_ptr = *data + sizeof(Config)/sizeof(float);
-  device_memory_map_weights(weights, config, weights_ptr, shared_weights);
-  memory_map_weights(weights, config, weights_ptr, shared_weights);
+  // device_memory_map_weights(weights, config, weights_ptr, shared_weights);
+  // memory_map_weights(weights, config, weights_ptr, shared_weights);
+  pinned_memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
 void print_transformer(Transformer* t) {
@@ -348,6 +440,7 @@ void softmax(float* x, int size) {
 //   // W (d,n) @ x (n,) -> xout (d,)
 //   // by far the most amount of time is spent inside this little function
 //   int i;
+//   // #pragma omp parallel for schedule(static)
 //   for (i = 0; i < d; i++) {
 //     float val = 0.0f;
 //     for (int j = 0; j < n; j++) {
@@ -357,225 +450,148 @@ void softmax(float* x, int size) {
 //   }
 // }
 
+void rope_enc(float* q, float* k, int dim, int head_size, int pos, int kv_dim) {
+  for (int i = 0; i < dim; i+=2) {
+    int head_dim = i % head_size;
+    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
+    int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+    for (int v = 0; v < rotn; v++) {
+      // printf("I am here\n");
+      float* vec = v == 0 ? q : k; // the vector to rotate (query or key)
+      // printf("vec: %f\n", vec[i]);
+      float v0 = vec[i];
+      float v1 = vec[i+1];
+      vec[i]   = v0 * fcr - v1 * fci;
+      vec[i+1] = v0 * fci + v1 * fcr;
+    }
+  }
+}
+
+void multihead_att(
+  float* sq, float* satt, float* sxb, float* key_cache, float* value_cache, 
+  int n_heads, int head_size, int seq_len, int pos, int loff, int kv_dim, int kv_mul) {
+  int h;
+  for (h = 0; h < n_heads; h++) {
+    // get the query vector for this head
+    float* q = sq + h * head_size;
+    // attention scores for this head
+    float* att = satt + h * seq_len;
+    // iterate over all timesteps, including the current one
+    for (int t = 0; t <= pos; t++) {
+      // get the key vector for this head and at this timestep
+      float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      // calculate the attention score as the dot product of q and k
+      float score = 0.0f;
+      for (int i = 0; i < head_size; i++) {
+        score += q[i] * k[i];
+      }
+      score /= sqrtf(head_size);
+      // save the score to the attention buffer
+      att[t] = score;
+    }
+
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
+
+    // weighted sum of the values, store back into xb
+    float* xb = sxb + h * head_size;
+    // memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+      // get the value vector for this head and at this timestep
+      float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      // get the attention weight for this timestep
+      float a = att[t];
+      // accumulate the weighted value into xb
+      for (int i = 0; i < head_size; i++) {
+        if (t == 0) {
+          xb[i] = a * v[i];
+        } else {
+          xb[i] += a * v[i];
+        }
+      }
+    }
+  }
+}
+
+void accum(float* dst, float* src, int size) {
+  for (int i = 0; i < size; i++) {
+    dst[i] += src[i];
+  }
+}
+
+void swiglu(float* shb, float* shb2, int hidden_dim) {
+  for (int i = 0; i < hidden_dim; i++) {
+    float val = shb[i];
+    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+    val *= (1.0f / (1.0f + expf(-val)));
+    // elementwise multiply with w3(x)
+    val *= shb2[i];
+    shb[i] = val;
+  }
+}
+
 
 //-------------------------------- DEVICE CODE GO DOWN HERE ----------------------------------------------
-// My gpu kernel code  
-// ----------------------------------------------------------------------------
-
-// Very basic matmul kernel
-__global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
-  // do the matmul
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= d) return;
-
+__global__ void matmul_kernel(float* xout, float* x, float* w, int n, int d) {
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= d) return;
   float val = 0.0f;
-  for (int j = 0; j<n; j++) {
-    val += w[tid * n + j] * x[j];
+
+  #pragma unroll
+  for (int j = 0; j < n; j++) {
+    val += w[i * n + j] * x[j];
   }
-
-  xout[tid] = val;
+  xout[i] = val; 
 }
 
-void matmul(float *xout, float *x, float *w, int n, int d) {
-  float *d_xout, *d_x, *d_w;
-  CHECK_HIP(hipMalloc(&d_xout, d * sizeof(float)));
-  CHECK_HIP(hipMalloc(&d_x, n * sizeof(float)));
-  CHECK_HIP(hipMalloc(&d_w, n * d * sizeof(float)));
-  CHECK_HIP(hipMemcpy(d_x, x, n * sizeof(float), hipMemcpyHostToDevice));
-  CHECK_HIP(hipMemcpy(d_w, w, n * d * sizeof(float), hipMemcpyHostToDevice));
-  dim3 block(256);
-  dim3 grid((d - 1 + block.x) / block.x);
-  matmul_kernel<<<grid, block>>>(d_xout, d_x, d_w, n, d);
+void matmul(float* xout, float* x, float* w, int n, int d) {
+  dim3 block(64);
+  dim3 grid((d + block.x - 1) / block.x);
+  matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
-
-  CHECK_HIP(hipMemcpy(xout, d_xout, d * sizeof(float), hipMemcpyDeviceToHost));
-  CHECK_HIP(hipFree(d_xout));
-  CHECK_HIP(hipFree(d_x));
-  CHECK_HIP(hipFree(d_w));
+  CHECK_HIP(hipDeviceSynchronize());
 }
 
-// __global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
-//   float ss = 0.0f;
-//   for (int j = 0; j < size; j++) {
-//     ss += x[j] * x[j];
-//   }
-//   ss /= size;
-//   ss += 1e-5f;
-//   ss = 1.0f / sqrtf(ss);
-//   // normalize and scale
-//   for (int j = 0; j < size; j++) {
-//     o[j] = weight[j] * (ss * x[j]);
-//   }
-// }
-
-// __global__ void softmax_kernel(float *x, int size) {
-//   // find max value (for numerical stability)
-//   float max_val = x[0];
-//   for (int i = 1; i < size; i++) {
-//     if (x[i] > max_val) {
-//       max_val = x[i];
-//     }
-//   }
-//   // exp and sum
-//   float sum = 0.0f;
-//   for (int i = 0; i < size; i++) {
-//     x[i] = expf(x[i] - max_val);
-//     sum += x[i];
-//   }
-//   // normalize
-//   for (int i = 0; i < size; i++) {
-//     x[i] /= sum;
-//   }
-// }
-
-
-// __device__ void softmax_gpu(float* x, int size) {
-//   // find max value (for numerical stability)
-//   float max_val = x[0];
-//   for (int i = 1; i < size; i++) {
-//     if (x[i] > max_val) {
-//       max_val = x[i];
-//     }
-//   }
-//   // exp and sum
-//   float sum = 0.0f;
-//   for (int i = 0; i < size; i++) {
-//     x[i] = expf(x[i] - max_val);
-//     sum += x[i];
-//   }
-//   // normalize
-//   for (int i = 0; i < size; i++) {
-//     x[i] /= sum;
-//   }
-// }
-
-// __global__ void RoPE_kernel(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, int kv_mul) {
+// __global__ void accumulate_kernel(float* dst, float* src, int size) {
 //   int i = blockIdx.x * blockDim.x + threadIdx.x;
-//   if (i >= dim / 2) return;
-//   int head_dim = i % head_size;
-//   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-//   float val = pos * freq;
-//   float fcr = cosf(val);
-//   float fci = sinf(val);
-//   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-//   for (int v = 0; v < rotn; v++) {
-//     float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-//     float v0 = vec[i];
-//     float v1 = vec[i+1];
-//     vec[i]   = v0 * fcr - v1 * fci;
-//     vec[i+1] = v0 * fci + v1 * fcr;
-//   }
+//   if (i >= size) return;
+//   dst[i] += src[i];
 // }
 
-// __global__ void mha_kernel(
-//   float* sq, float* satt, float* key_cache, float* value_cache, float* sxb, 
-//   int num_heads, int seq_len, int pos, int loff, int kv_dim, int kv_mul, int head_size
-//   ) {
-//   // multihead attention. iterate over all heads
-//   int h = blockIdx.x * blockDim.x + threadIdx.x;
-//   if (h >= num_heads) return;
-
-//   // get the query vector for this head
-//   float* q = sq + h * head_size;
-//   // attention scores for this head
-//   float* att = satt + h * seq_len;
-//   // iterate over all timesteps, including the current one
-//   for (int t = 0; t <= pos; t++) {
-//     // get the key vector for this head and at this timestep
-//     float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-//     // calculate the attention score as the dot product of q and k
-//     float score = 0.0f;
-//     for (int i = 0; i < head_size; i++) {
-//       score += q[i] * k[i];
-//     }
-//     score /= sqrtf(head_size);
-//     // save the score to the attention buffer
-//     att[t] = score;
-//   }
-//   __syncthreads();
-//   // softmax the scores to get attention weights, from 0..pos inclusively
-//   softmax_gpu(att, pos + 1);
-
-//   __syncthreads();
-
-//   // weighted sum of the values, store back into xb
-//   float* xb = sxb + h * head_size;
-//   // memset(xb, 0, head_size * sizeof(float));
-//   for (int t = 0; t <= pos; t++) {
-//     // get the value vector for this head and at this timestep
-//     float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-//     // get the attention weight for this timestep
-//     float a = att[t];
-//     // accumulate the weighted value into xb
-//     for (int i = 0; i < head_size; i++) {
-//       if (t == 0) xb[i] = a * v[i];
-//       else xb[i] += a * v[i];
-//     }
-//   }
-// }
-
-// __global__ void accumulate_kernel(float* output, float* input, int size) {
-//   for (int i = 0; i < size; i++) {
-//     output[i] += input[i];
-//   }
-// }
-
-// __global__ void swiglu_kernel(float* shb, float* shb2, int hidden_dim) {
-//   int i = blockIdx.x * blockDim.x + threadIdx.x;
-//   if (i >= hidden_dim) return;
-//   float val = shb[i];
-//   // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-//   val *= (1.0f / (1.0f + expf(-val)));
-//   // elementwise multiply with w3(x)
-//   val *= shb2[i];
-//   shb[i] = val;
-// }
-
-// void rmsnorm(float* o, float* x, float* weight, int size) {
-//   rmsnorm_kernel<<<1, 1>>>(o, x, weight, size);
-//   CHECK_HIP(hipGetLastError());
-// }
-
-// void softmax(float* x, int size) {
-//   softmax_kernel<<<1, 1>>>(x, size);
-//   CHECK_HIP(hipGetLastError());
-// }
-
-// void matmul(float* xout, float* x, float* w, int n, int d) {
+// void accum(float* dst, float* src, int size) {
 //   dim3 block(256);
-//   dim3 grid((d - 1 + block.x) / block.x);
-//   matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
+//   dim3 grid((size + block.x - 1) / block.x);
+//   accumulate_kernel<<<grid, block>>>(dst, src, size);
 //   CHECK_HIP(hipGetLastError());
-// } 
+//   CHECK_HIP(hipDeviceSynchronize());
 
-// void MultiHeadAttention(float* sq, float* sattt, float* key_cache, float* value_cache, float* sxb, 
-//   int num_heads, int seq_len, int pos, int loff, int kv_dim, int kv_mul, int head_size) {
-//   dim3 block(256);
-//   dim3 grid((num_heads - 1 + block.x) / block.x);
-//   mha_kernel<<<grid, block>>>(sq, sattt, key_cache, value_cache, sxb, num_heads, seq_len, pos, loff, kv_dim, kv_mul, head_size);
-//   CHECK_HIP(hipGetLastError());
 // }
 
-// void accum(float *output, float *input, int size) {
-//   accumulate_kernel<<<1, 1>>>(output, input, size);
-//   CHECK_HIP(hipGetLastError());
-// }
+__global__ void swiglu_kernel(float* shb, float* shb2, int hidden_dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden_dim) return;
+  float val = shb[i];
+  // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+  val *= (1.0f / (1.0f + expf(-val)));
+  // elementwise multiply with w3(x)
+  val *= shb2[i];
+  shb[i] = val;
+}
 
 // void swiglu(float* shb, float* shb2, int hidden_dim) {
 //   dim3 block(256);
-//   dim3 grid((hidden_dim - 1 + block.x) / block.x);
+//   dim3 grid((hidden_dim + block.x - 1) / block.x);
 //   swiglu_kernel<<<grid, block>>>(shb, shb2, hidden_dim);
 //   CHECK_HIP(hipGetLastError());
+//   CHECK_HIP(hipDeviceSynchronize());
 // }
 
-// void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, int kv_mul) {
-//   dim3 block(256);
-//   dim3 grid((dim / 2 - 1 + block.x) / block.x);
-//   RoPE_kernel<<<grid, block>>>(sq, sk, pos, dim, head_size, kv_dim, kv_mul);
-//   CHECK_HIP(hipGetLastError());
-// }
-
-// ----------------------------------------------------------
+// -------------------------------------------------------------------------------------------------------
 
 float* forward(Transformer* transformer, int token, int pos) {
 
@@ -593,94 +609,31 @@ float* forward(Transformer* transformer, int token, int pos) {
   // copy the token embedding into x
   float* content_row = w->token_embedding_table + token * dim;
   memcpy(x, content_row, dim*sizeof(*x));
-  // CHECK_HIP(hipMemcpy(x, content_row, dim * sizeof(float), hipMemcpyDeviceToDevice));
 
   // forward all the layers
   for(unsigned long long l = 0; l < p->n_layers; l++) {
-    // printf("Layer: %llu\n", l);
     // attention rmsnorm
     rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
-
     // key and value point to the kv cache
     int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
     s->k = s->key_cache + loff + pos * kv_dim;
     s->v = s->value_cache + loff + pos * kv_dim;
-
     // qkv matmuls for this position
     matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
     matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each head
-    for (int i = 0; i < dim; i+=2) {
-      int head_dim = i % head_size;
-      float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-      float val = pos * freq;
-      float fcr = cosf(val);
-      float fci = sinf(val);
-      int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-      for (int v = 0; v < rotn; v++) {
-        // printf("I am here\n");
-        float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-        // printf("vec: %f\n", vec[i]);
-        float v0 = vec[i];
-        float v1 = vec[i+1];
-        vec[i]   = v0 * fcr - v1 * fci;
-        vec[i+1] = v0 * fci + v1 * fcr;
-      }
-    }
-    // RoPE(s->q, s->k, pos, dim, head_size, kv_dim, kv_mul);
+    rope_enc(s->q, s->k, dim, head_size, pos, kv_dim);
 
     // multihead attention. iterate over all heads
-    int h;
-    for (h = 0; h < p->n_heads; h++) {
-      // get the query vector for this head
-      float* q = s->q + h * head_size;
-      // attention scores for this head
-      float* att = s->att + h * p->seq_len;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-        }
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
-        att[t] = score;
-      }
-
-      // softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float* xb = s->xb + h * head_size;
-      memset(xb, 0, head_size * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into xb
-        for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-        }
-      }
-    }
-
-    // MultiHeadAttention(s, p, p->n_heads, pos, loff, kv_dim, kv_mul, head_size);
-    // MultiHeadAttention(s->q, s->att, s->key_cache, s->value_cache, s->xb, p->n_heads, p->seq_len, pos, loff, kv_dim, kv_mul, head_size);
+    multihead_att(s->q, s->att, s->xb, s->key_cache, s->value_cache, p->n_heads, head_size, p->seq_len, pos, loff, kv_dim, kv_mul);
 
     // final matmul to get the output of the attention
     matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
     // residual connection back into x
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb2[i];
-    }
-    // accum(x, s->xb2, dim);
+    accum(x, s->xb2, dim); // residual connection
 
     // ffn rmsnorm
     rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
@@ -691,34 +644,20 @@ float* forward(Transformer* transformer, int token, int pos) {
     matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
     // SwiGLU non-linearity
-    for (int i = 0; i < hidden_dim; i++) {
-      float val = s->hb[i];
-      // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-      val *= (1.0f / (1.0f + expf(-val)));
-      // elementwise multiply with w3(x)
-      val *= s->hb2[i];
-      s->hb[i] = val;
-    }
-    // swiglu(s->hb, s->hb2, hidden_dim);
+    swiglu(s->hb, s->hb2, hidden_dim);
 
     // final matmul to get the output of the ffn
     matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
     // residual connection
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb[i];
-    }
-    // accum(x, s->xb, dim);
-    // printf("Layer: %llu\n", l);
+    accum(x, s->xb, dim); // residual connection
   }
 
   // final rmsnorm
   rmsnorm(x, x, w->rms_final_weight, dim);
   // classifier into logits
   matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
-  // CHECK_HIP(hipMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-  // printf("Pass last copy\n");
-  
+
   return s->logits;
 }
 
