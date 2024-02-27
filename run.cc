@@ -385,7 +385,6 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int 
 }
 void rmsnorm(float* o, float* x, float* weight, int size) {
     int elementsPerThread = divUp(size, num_threads_lrg);
-    printf("num_threads_lrg: %d\n", num_threads_lrg);
     rmsnorm_kernel <<<1, num_threads_lrg >>> (o, x, weight, size, elementsPerThread);
 }
 #else
@@ -549,7 +548,6 @@ void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
   // dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
   // RoPE_kernel<<<grid, block>>>(s->q, s->k, pos, dim, head_size, kv_dim);
   // CHECK_HIP(hipDeviceSynchronize());
-  printf("dim: %d\n", dim);
   RoPE_kernel<<<1, dim/2 >>>(pos, s->q, s->k, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
