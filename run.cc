@@ -464,10 +464,11 @@ void softmax(float* x, int size) {
   }
 }
 
-
+#define TILES_SIZE 32
 // Very basic matmul kernel
 #ifdef USE_GPU
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -479,11 +480,53 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
     val += w[i * n + j] * x[j];
   }
   xout[i] = val; 
+
+  // // MATMUL FROM COURSE
+// __global__ void matmul_kernel(float *C, float *B, float *A, int K, int M) {
+  // int N = 1;
+  // // (TODO) Implement matrix multiplication on GPU
+  // int j = blockIdx.x * blockDim.x + threadIdx.x;
+  // int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+  // int gj = blockIdx.x, gi = blockIdx.y;
+  // int lj = threadIdx.x, li = threadIdx.y;
+
+  // if (gj * TILES_SIZE >= N || gi * TILES_SIZE >= M) return;
+
+
+  // __shared__ float Alocal[TILES_SIZE][TILES_SIZE];
+  // __shared__ float Blocal[TILES_SIZE][TILES_SIZE];
+  // float c = 0.f;
+
+  // for (int bk = 0; bk < K; bk+=TILES_SIZE) {
+  //   int Ai = gi * TILES_SIZE + li, Bj = gj * TILES_SIZE + lj;
+  //   int Aj = bk + lj, Bi = bk + li;
+  //   Alocal[li][lj] = (Ai < M && Aj < K) ? A[Ai * K + Aj] : 0.f;
+  //   Blocal[li][lj] = (Bi < K && Bj < N) ? B[Bi * N + Bj] : 0.f;
+  //   __syncthreads();
+
+  //   int lk;
+  //   for (lk = 0; lk < TILES_SIZE; lk+=4) {
+  //     float4 A4 = *(float4*)&Alocal[li][lk];
+  //     for (int l = 0; l < 4; l++)
+  //       c += ((float *)(&A4))[l] * Blocal[lk + l][lj];
+  //   }
+
+  //   for (; lk < TILES_SIZE; lk++)
+  //     c += Alocal[li][lk] * Blocal[lk][lj];
+
+  //   __syncthreads();
+  // }
+
+  // if (i < M && j < N) C[i * N + j] = c;
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
   dim3 block(64);
   dim3 grid((d - 1 + block.x) / block.x);
+  // d: M, n: K
+  // dim3 block(32, 32);
+  // dim3 grid(1, (d - 1 + block.y) / block.y);
   matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
   CHECK_HIP(hipDeviceSynchronize());
@@ -507,28 +550,11 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 
 #ifdef USE_GPU
 __global__ void RoPE_kernel(int pos, float* sq, float* sk, 
-                            int kv_dim, int head_size) {
-//   int i = blockIdx.x * blockDim.x + threadIdx.x;
-//   i *= 2; 
-//   if (i >= dim) return;
+                            int dim, int kv_dim, int head_size) {
+  int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+  if (i >= dim) return;
 
-//   int head_dim = i % head_size;
-//   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-//   float val = pos * freq;
-//   float fcr = cosf(val);
-//   float fci = sinf(val);
-//   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-//   for (int v = 0; v < rotn; v++) {
-//     // printf("I am here\n");
-//     float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-//     // printf("vec: %f\n", vec[i]);
-//     float v0 = vec[i];
-//     float v1 = vec[i+1];
-//     vec[i]   = v0 * fcr - v1 * fci;
-//     vec[i+1] = v0 * fci + v1 * fcr;
-//   }
-// }
-  int i = threadIdx.x * 2;
+  // int i = threadIdx.x * 2;
   int head_dim = i % head_size;
   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
   float val = pos * freq;
@@ -536,19 +562,17 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
   float fci = sinf(val);
   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
   for (int v = 0; v < rotn; v++) {
-      float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-      float v0 = vec[i];
-      float v1 = vec[i+1];
-      vec[i]   = v0 * fcr - v1 * fci;
-      vec[i+1] = v0 * fci + v1 * fcr;
+    float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
+    float v0 = vec[i];
+    float v1 = vec[i+1];
+    vec[i]   = v0 * fcr - v1 * fci;
+    vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
 void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
-  // dim3 block(256);
-  // dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  // RoPE_kernel<<<grid, block>>>(s->q, s->k, pos, dim, head_size, kv_dim);
-  // CHECK_HIP(hipDeviceSynchronize());
-  RoPE_kernel<<<1, dim/2 >>>(pos, s->q, s->k, kv_dim, head_size);
+  dim3 block(256);
+  dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
+  RoPE_kernel<<<grid, block>>>(pos, s->q, s->k, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
 #else
