@@ -22,7 +22,7 @@
     hipError_t error = (cmd);                                                            \
     if (error != hipSuccess)                                                             \
     {                                                                                    \
-      std::cerr << "Encountered HIP error (" << hipGetErrorString(error) << ") at line " \
+      std::cerr << "HIP error (" << hipGetErrorString(error) << ") at line "             \
                 << __LINE__ << " in file " << __FILE__ << "\n";                          \
       exit(-1);                                                                          \
     }                                                                                    \
@@ -128,7 +128,8 @@ void malloc_run_state(RunState* s, Config* p) {
     CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float)));
-    s->logits = (float *)calloc(p->vocab_size, sizeof(float));
+    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
+    // s->logits = (float *)calloc(p->vocab_size, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
@@ -169,7 +170,8 @@ void free_run_state(RunState* s) {
     CHECK_HIP(hipFree(s->q));
     CHECK_HIP(hipFree(s->att));
     CHECK_HIP(hipFree(s->logits_gpu));
-    free(s->logits);
+    CHECK_HIP(hipHostFree(s->logits));    
+    // free(s->logits);
     CHECK_HIP(hipFree(s->key_cache));
     CHECK_HIP(hipFree(s->value_cache));
 }
@@ -293,21 +295,21 @@ void free_transformer(Transformer* t) {
 __inline__ __device__
 float warpReduceSum(float val) {
   for (int offset = warpSize/2; offset > 0; offset /= 2) 
-    val += __shfl_down(val, offset, 64);
+    val += __shfl_down(val, offset);
   return val;
 }
 
 __inline__ __device__
 float warpReduceMax(float val) {
   for (int offset = warpSize/2; offset > 0; offset /= 2) 
-    val = max(val, __shfl_down(val, offset, 64));
+    val = max(val, __shfl_down(val, offset));
   return val;
 }
 
 __inline__ __device__
 float blockReduceSum(float val) {
 
-  static __shared__ float shared[64]; // Shared mem for 64 partial sums
+  static __shared__ float shared[16]; // Shared mem for 16 partial sums
   int lane = threadIdx.x % warpSize;
   int wid = threadIdx.x / warpSize;
 
@@ -328,7 +330,7 @@ float blockReduceSum(float val) {
 __inline__ __device__
 float blockReduceMax(float val) {
 
-  static __shared__ float shared[64]; // Shared mem for 64 partial max values
+  static __shared__ float shared[16]; // Shared mem for 16 partial max values
   int lane = threadIdx.x % warpSize;
   int wid = threadIdx.x / warpSize;
 
@@ -464,70 +466,27 @@ void softmax(float* x, int size) {
   }
 }
 
-#define TILES_SIZE 32
-// Very basic matmul kernel
 #ifdef USE_GPU
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= d) return;
+  int d_i = blockIdx.x;
   float val = 0.0f;
 
-  #pragma unroll
-  for (int j = 0; j < n; j++) {
-    val += w[i * n + j] * x[j];
+  for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+    val += w[d_i * n + idx] * x[idx];
   }
-  xout[i] = val; 
+  val = blockReduceSum(val);
 
-  // // MATMUL FROM COURSE
-// __global__ void matmul_kernel(float *C, float *B, float *A, int K, int M) {
-  // int N = 1;
-  // // (TODO) Implement matrix multiplication on GPU
-  // int j = blockIdx.x * blockDim.x + threadIdx.x;
-  // int i = blockIdx.y * blockDim.y + threadIdx.y;
-
-  // int gj = blockIdx.x, gi = blockIdx.y;
-  // int lj = threadIdx.x, li = threadIdx.y;
-
-  // if (gj * TILES_SIZE >= N || gi * TILES_SIZE >= M) return;
-
-
-  // __shared__ float Alocal[TILES_SIZE][TILES_SIZE];
-  // __shared__ float Blocal[TILES_SIZE][TILES_SIZE];
-  // float c = 0.f;
-
-  // for (int bk = 0; bk < K; bk+=TILES_SIZE) {
-  //   int Ai = gi * TILES_SIZE + li, Bj = gj * TILES_SIZE + lj;
-  //   int Aj = bk + lj, Bi = bk + li;
-  //   Alocal[li][lj] = (Ai < M && Aj < K) ? A[Ai * K + Aj] : 0.f;
-  //   Blocal[li][lj] = (Bi < K && Bj < N) ? B[Bi * N + Bj] : 0.f;
-  //   __syncthreads();
-
-  //   int lk;
-  //   for (lk = 0; lk < TILES_SIZE; lk+=4) {
-  //     float4 A4 = *(float4*)&Alocal[li][lk];
-  //     for (int l = 0; l < 4; l++)
-  //       c += ((float *)(&A4))[l] * Blocal[lk + l][lj];
-  //   }
-
-  //   for (; lk < TILES_SIZE; lk++)
-  //     c += Alocal[li][lk] * Blocal[lk][lj];
-
-  //   __syncthreads();
-  // }
-
-  // if (i < M && j < N) C[i * N + j] = c;
+  if (threadIdx.x == 0) {
+    xout[d_i] = val;
+  }
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
-  dim3 block(64);
-  dim3 grid((d - 1 + block.x) / block.x);
-  // d: M, n: K
-  // dim3 block(32, 32);
-  // dim3 grid(1, (d - 1 + block.y) / block.y);
-  matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
+  matmul_kernel<<<d, 512>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
   CHECK_HIP(hipDeviceSynchronize());
 }
@@ -554,7 +513,6 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
   int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
   if (i >= dim) return;
 
-  // int i = threadIdx.x * 2;
   int head_dim = i % head_size;
   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
   float val = pos * freq;
@@ -570,7 +528,7 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
   }
 }
 void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
-  dim3 block(256);
+  dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
   RoPE_kernel<<<grid, block>>>(pos, s->q, s->k, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
@@ -596,7 +554,6 @@ void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) { //s->q, s-
 #endif
 
 #ifdef USE_GPU
-// TODO refactor vs C code
 __global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
   int h = blockIdx.x;
   // get the query vector for this head
