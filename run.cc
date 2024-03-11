@@ -471,27 +471,45 @@ void softmax(float* x, int size) {
 
 // Very basic matmul kernel
 #ifdef USE_GPU
+// __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+//   // W (d,n) @ x (n,) -> xout (d,)
+//   // by far the most amount of time is spent inside this little function
+//   int i = blockIdx.x * blockDim.x + threadIdx.x;
+//   if (i >= d) return;
+//   float val = 0.0f;
+
+//   #pragma unroll
+//   for (int j = 0; j < n; j+=4) {
+//     val += w[i * n + j] * x[j];
+//     val += w[i * n + j+1] * x[j+1];
+//     val += w[i * n + j+2] * x[j+2];
+//     val += w[i * n + j+3] * x[j+3];
+//   }
+//   xout[i] = val; 
+// }
+
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= d) return;
+  int d_i = blockIdx.x;
   float val = 0.0f;
 
-  #pragma unroll
-  for (int j = 0; j < n; j+=4) {
-    val += w[i * n + j] * x[j];
-    val += w[i * n + j+1] * x[j+1];
-    val += w[i * n + j+2] * x[j+2];
-    val += w[i * n + j+3] * x[j+3];
+  for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+    val += w[d_i * n + idx] * x[idx];
   }
-  xout[i] = val; 
+
+  val = blockReduceSum(val);
+
+  if (threadIdx.x == 0) {
+    xout[d_i] = val;
+  }
+
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
-  dim3 block(4);
-  dim3 grid((d - 1 + block.x) / block.x);
-  matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
+  // dim3 block(4);
+  // dim3 grid((d - 1 + block.x) / block.x);
+  // matmul_kernel<<<grid, block>>>(xout, x, w, n, d);
+  matmul_kernel<<<d, 512>>>(xout, x, w, n, d);
 }
 #else
 void matmul(float* xout, float* x, float* w, int n, int d) {
@@ -553,6 +571,7 @@ void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
   // dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
   // RoPE_kernel<<<grid, block>>>(s->q, s->k, pos, dim, head_size, kv_dim);
   // CHECK_HIP(hipDeviceSynchronize());
+  // printf("Dim / 2 = %d\n", dim/2);
   RoPE_kernel<<<1, dim/2 >>>(pos, s->q, s->k, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
