@@ -1593,10 +1593,9 @@ int multi_test(
   int batch=1) { 
 
   int numDevices;
-  CHECK_HIP(hipGetDeviceCount(&numDevices))
+  CHECK_HIP(hipGetDeviceCount(&numDevices));
 
   int *num_gen_tokens = (int*)malloc(numDevices * sizeof(int));
-  
 #pragma omp parallel for num_threads(numDevices) schedule(static) shared(num_gen_tokens, requests)
   for (int d=0; d<numDevices; d++) {
     int device = omp_get_thread_num();
@@ -1638,9 +1637,9 @@ int multi_test(
   }
 
   // memory and file handles cleanup
-  free_sampler(&sampler);
-  free_tokenizer(&tokenizer);
-  free_transformer(&transformer);
+  // free_sampler(&sampler);
+  // free_tokenizer(&tokenizer);
+  // free_transformer(&transformer);
 
   return gen_cnt;
 
