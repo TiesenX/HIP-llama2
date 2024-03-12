@@ -14,6 +14,7 @@
 #include <iostream>
 
 #include <hip/hip_runtime.h>
+#include <omp.h>
 #include <math.h>
 
 // Macros for error checking
@@ -529,12 +530,29 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 
 
 #ifdef USE_GPU
-__global__ void RoPE_kernel(int pos, float* sq, float* sk, 
-                            int kv_dim, int head_size) {
-//   int i = blockIdx.x * blockDim.x + threadIdx.x;
-//   i *= 2; 
-//   if (i >= dim) return;
+// __global__ void RoPE_kernel(int pos, float* sq, float* sk, 
+//                             int kv_dim, int head_size) {
+// //   int i = blockIdx.x * blockDim.x + threadIdx.x;
+// //   i *= 2; 
+// //   if (i >= dim) return;
 
+// //   int head_dim = i % head_size;
+// //   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+// //   float val = pos * freq;
+// //   float fcr = cosf(val);
+// //   float fci = sinf(val);
+// //   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+// //   for (int v = 0; v < rotn; v++) {
+// //     // printf("I am here\n");
+// //     float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
+// //     // printf("vec: %f\n", vec[i]);
+// //     float v0 = vec[i];
+// //     float v1 = vec[i+1];
+// //     vec[i]   = v0 * fcr - v1 * fci;
+// //     vec[i+1] = v0 * fci + v1 * fcr;
+// //   }
+// // }
+//   int i = threadIdx.x * 2;
 //   int head_dim = i % head_size;
 //   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
 //   float val = pos * freq;
@@ -542,16 +560,19 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
 //   float fci = sinf(val);
 //   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
 //   for (int v = 0; v < rotn; v++) {
-//     // printf("I am here\n");
-//     float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-//     // printf("vec: %f\n", vec[i]);
-//     float v0 = vec[i];
-//     float v1 = vec[i+1];
-//     vec[i]   = v0 * fcr - v1 * fci;
-//     vec[i+1] = v0 * fci + v1 * fcr;
+//       float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
+//       float v0 = vec[i];
+//       float v1 = vec[i+1];
+//       vec[i]   = v0 * fcr - v1 * fci;
+//       vec[i+1] = v0 * fci + v1 * fcr;
 //   }
 // }
-  int i = threadIdx.x * 2;
+
+__global__ void RoPE_kernel(int pos, float* sq, float* sk, 
+                            int dim, int kv_dim, int head_size) {
+  int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+  if (i >= dim) return;
+
   int head_dim = i % head_size;
   float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
   float val = pos * freq;
@@ -559,22 +580,29 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
   float fci = sinf(val);
   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
   for (int v = 0; v < rotn; v++) {
-      float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-      float v0 = vec[i];
-      float v1 = vec[i+1];
-      vec[i]   = v0 * fcr - v1 * fci;
-      vec[i+1] = v0 * fci + v1 * fcr;
+    float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
+    float v0 = vec[i];
+    float v1 = vec[i+1];
+    vec[i]   = v0 * fcr - v1 * fci;
+    vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
 void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
-  // dim3 block(256);
-  // dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  // RoPE_kernel<<<grid, block>>>(s->q, s->k, pos, dim, head_size, kv_dim);
-  // CHECK_HIP(hipDeviceSynchronize());
-  // printf("Dim / 2 = %d\n", dim/2);
-  RoPE_kernel<<<1, dim/2 >>>(pos, s->q, s->k, kv_dim, head_size);
+  dim3 block(64);
+  dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
+  RoPE_kernel<<<grid, block>>>(pos, s->q, s->k, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
+
+// void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
+//   // dim3 block(256);
+//   // dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
+//   // RoPE_kernel<<<grid, block>>>(s->q, s->k, pos, dim, head_size, kv_dim);
+//   // CHECK_HIP(hipDeviceSynchronize());
+//   // printf("Dim / 2 = %d\n", dim/2);
+//   RoPE_kernel<<<1, dim/2 >>>(pos, s->q, s->k, kv_dim, head_size);
+//   CHECK_HIP(hipGetLastError());
+// }
 #else
 void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) { //s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size) {
     for (int i = 0; i < dim; i+=2) {
@@ -1462,20 +1490,19 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
 // ----------------------------------------------------------------------------
 // You should parallelize and optimize from this function exploiting multiple GPUs
 //
-int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1) {
+int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1, int start_idx=0, int end_idx=0) {
   // Count the number of the generated tokens
   int gen_cnt = 0;
 
   // Avoid randomness to generate tokens for batch input
   // Each input request has its Sampler each
   Sampler samplers[requests->num_reqs];
-  for(int idx = 0; idx < requests->num_reqs; idx++) {
+  for(int idx = start_idx; idx < end_idx; idx++) {
     build_sampler(&samplers[idx], transformer->config.vocab_size, 1.0f, 0.9f, 314028);
   }
 
   // Loop for the multiple requests
-  // #pragma omp parallel for 
-  for(int idx = 0; idx < requests->num_reqs; idx++) {
+  for(int idx = start_idx; idx < end_idx; idx++) {
     std::string gen_str = "";
     char* prompt = get_str_req_ptr(requests, idx);
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
@@ -1546,10 +1573,77 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
     printf("End of the request\n");
   }
 
-  for(int idx = 0; idx < requests->num_reqs; idx++) {
+  for(int idx = start_idx; idx < end_idx; idx++) {
     free_sampler(&samplers[idx]);
   }
   return gen_cnt;
+}
+
+
+int multi_test(
+  Requests* requests,
+  char* checkpoint_path=NULL,
+  char* tokenizer_path = (char*)"tokenizer.bin",
+  float temperature=1.0f,
+  float topp=0.9f,
+  int steps=256,
+  unsigned long long rng_seed=0,
+  char* input_filename=NULL,
+  char* output_filename=NULL,
+  int batch=1) { 
+
+  int numDevices;
+  CHECK_HIP(hipGetDeviceCount(&numDevices))
+
+  int *num_gen_tokens = (int*)malloc(numDevices * sizeof(int));
+  
+#pragma omp parallel for num_threads(numDevices) schedule(static) shared(num_gen_tokens, requests)
+  for (int d=0; d<numDevices; d++) {
+    int device = omp_get_thread_num();
+    CHECK_HIP(hipSetDevice(device));
+
+    Transformer transformer;
+    build_transformer(&transformer, checkpoint_path);
+    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+
+    // build the Tokenizer via the tokenizer .bin file
+    Tokenizer tokenizer;
+    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+
+    // build the Sampler
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+    
+    // Split the requests into the number of devices
+    printf("Build transformers from GPU %d\n", device);
+
+    steps = transformer.config.seq_len;
+
+    if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, requests)) {
+      fprintf(stderr, "cannot read input file: %s\n", input_filename);
+      exit(EXIT_FAILURE);
+    }
+
+    int total_reqs = requests->num_reqs;
+
+    int start = total_reqs / numDevices * device;
+    int end = total_reqs / numDevices * (device + 1);
+    if (device == numDevices - 1) end = total_reqs;
+    num_gen_tokens[device] = test(&transformer, &tokenizer, requests, batch, start, end);
+  }
+
+  int gen_cnt = 0;
+  for (int i = 0; i<numDevices; i++) {
+    gen_cnt += num_gen_tokens[i];
+  }
+
+  // memory and file handles cleanup
+  free_sampler(&sampler);
+  free_tokenizer(&tokenizer);
+  free_transformer(&transformer);
+
+  return gen_cnt;
+
 }
 
 
@@ -1626,43 +1720,47 @@ int main(int argc, char *argv[]) {
   if (steps < 0) steps = 0;
 
   // build the Transformer via the model .bin file
-  Transformer transformer;
-  build_transformer(&transformer, checkpoint_path);
-  if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+  // Transformer transformer;
+  // build_transformer(&transformer, checkpoint_path);
+  // if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
-  // build the Tokenizer via the tokenizer .bin file
-  Tokenizer tokenizer;
-  build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+  // // build the Tokenizer via the tokenizer .bin file
+  // Tokenizer tokenizer;
+  // build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
-  // build the Sampler
-  Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+  // // build the Sampler
+  // Sampler sampler;
+  // build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
   Requests requests;
 
   // run!
   if (strcmp(mode, "generate") == 0) {
-    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    // generate(&transformer, &tokenizer, &sampler, prompt, steps);
   } 
   else if (strcmp(mode, "chat") == 0) {
     //chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
   } 
   else if  (strcmp(mode, "test") == 0) {
-    int num_reqs;
-    steps = transformer.config.seq_len;
+    // int num_reqs;
+    // steps = transformer.config.seq_len;
     if(input_filename == NULL || output_filename == NULL) {
       error_usage();
     }
-    if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, &requests)) {
-      fprintf(stderr, "cannot read input file: %s\n", input_filename);
-      exit(EXIT_FAILURE);
-    }
+    // if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, &requests)) {
+    //   fprintf(stderr, "cannot read input file: %s\n", input_filename);
+    //   exit(EXIT_FAILURE);
+    // }
 
     // Don't modify this parts for evaluation
     // {
     long start, end;
     start = time_in_ms();
-    int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch);
+    // int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch, 0, requests.num_reqs);
+    // printf("Prepare to run\n");
+    int num_gen_tokens = multi_test(&requests,
+      checkpoint_path, tokenizer_path, temperature, topp, steps, rng_seed, input_filename, output_filename, 
+      batch);
     end = time_in_ms();
 
     // Your goal is to achieve best throughput(=reduce elapsed time)! 
@@ -1682,9 +1780,9 @@ int main(int argc, char *argv[]) {
   }
 
   // memory and file handles cleanup
-  free_sampler(&sampler);
-  free_tokenizer(&tokenizer);
-  free_transformer(&transformer);
+  // free_sampler(&sampler);
+  // free_tokenizer(&tokenizer);
+  // free_transformer(&transformer);
   return 0;
 }
 #endif
