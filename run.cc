@@ -525,52 +525,94 @@ void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) { /
     }
 }
 
-__global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
-  int h = blockIdx.x;
-  // get the query vector for this head
-  float* q = sq + h * head_size;
-  // attention scores for this head
-  float* att = satt + h * seq_len;
-  // iterate over all timesteps, including the current one 
-  // In hip, each thread does a small portion of the calc
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    // get the key vector for this head and at this timestep
-    float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-    // calculate the attention score as the dot product of q and k
-    float score = 0.0f;
-    for (int i = 0; i < head_size; i++) {
-        score += q[i] * k[i];
-    }
-    score /= sqrtf(head_size);
-    // save the score to the attention buffer
-    att[t] = score;
-  }
-  // above was this threads portion of the iteration.  wait for all threads to finish
-  __syncthreads();
+#define MAX_SEQ_LEN 8192
+// __global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff, int dim) {
+  // int h = blockIdx.x;
+  // // get the query vector for this head
+  // float* q = sq + h * head_size;
+  // // attention scores for this head
+  // float* att = satt + h * seq_len;
+  // // iterate over all timesteps, including the current one 
+  // // In hip, each thread does a small portion of the calc
+  // for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
+  //   // get the key vector for this head and at this timestep
+  //   float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+  //   // calculate the attention score as the dot product of q and k
+  //   float score = 0.0f;
+  //   for (int i = 0; i < head_size; i++) {
+  //       score += q[i] * k[i];
+  //   }
+  //   score /= sqrtf(head_size);
+  //   // save the score to the attention buffer
+  //   att[t] = score;
+  // }
+  // // above was this threads portion of the iteration.  wait for all threads to finish
+  // __syncthreads();
 
-  // softmax the scores to get attention weights, from 0..pos inclusively
-  softmax_gpu(att, pos + 1);
-  __syncthreads();
+  // // softmax the scores to get attention weights, from 0..pos inclusively
+  // softmax_gpu(att, pos + 1);
+  // __syncthreads();
 
-  // weighted sum of the values, store back into xb
-  // NOTE: by swapping the order of the for loops (vs. C) a simpler
-  // version of the code accomplishes the same task and fits more
-  // naturally with the hip way of subdividing the problem.
-  float* xb = sxb + h * head_size;
-  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-    float val = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // get the attention weight for this timestep
-        float a = att[t];
-        val += a * v[i];
+  // // weighted sum of the values, store back into xb
+  // // NOTE: by swapping the order of the for loops (vs. C) a simpler
+  // // version of the code accomplishes the same task and fits more
+  // // naturally with the hip way of subdividing the problem.
+  // float* xb = sxb + h * head_size;
+  // for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+  //   float val = 0.0f;
+  //   for (int t = 0; t <= pos; t++) {
+  //       // get the value vector for this head and at this timestep
+  //       float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+  //       // get the attention weight for this timestep
+  //       float a = att[t];
+  //       val += a * v[i];
+  //   }
+  //   xb[i] = val;
+  // }
+__global__ void MultiHeadAttention_kernel(float* __restrict__ output, const float* __restrict__ sq,
+    const float* __restrict__ key_cache, const float* __restrict__ value_cache,
+    int num_heads, int head_size, int loff, int seq_len, int dim) {
+
+    int h = blockIdx.x;
+
+    // get the query vector for this head
+    const float* q = sq + h * head_size;
+    // attention scores for this head
+    __shared__ float att[MAX_SEQ_LEN];
+
+    // iterate over all timesteps, including the current one
+    for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
+        // get the key vector for this head and at this timestep
+        const float* k = key_cache + loff + t * dim + h * head_size;
+        // calculate the attention score as the dot product of q and k
+        float score = 0.0f;
+        for (int i = 0; i < head_size; i++)
+            score += q[i] * k[i];
+        score /= sqrtf(head_size);
+        // save the score to the attention buffer
+        att[t] = score;
     }
-    xb[i] = val;
-  }
+    __syncthreads();
+
+    // softmax the scores to get attention weights
+    softmax_gpu(att, seq_len);
+    __syncthreads();
+
+    // weighted sum of the values, store back into xb
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++)
+            val += att[t] * value_cache[loff + t * dim + h * head_size + i];
+        output[h * head_size + i] = val;
+    }
 }
-void gpu_MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
-    MultiHeadAttention_kernel <<<p->n_heads, num_threads_lrg>>> (pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff);
+// void gpu_MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
+    // MultiHeadAttention_kernel <<<p->n_heads, num_threads_lrg>>> (pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff, head_size * p->n_heads);
+// }
+
+void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int head_size, int loff, int seq_len) {
+    int dim = head_size * num_heads;
+    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg>>> (output, q, key_cache, value_cache, num_heads, head_size, loff, seq_len, dim);
 }
 
 void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
@@ -698,7 +740,13 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim);
 
-    gpu_MultiHeadAttention(pos, p, s, kv_dim, kv_mul, head_size, loff);
+    // save key,value at this time step (pos) to our kv cache
+    float* key_cache_row = s->key_cache + loff + pos * dim;
+    float* value_cache_row = s->value_cache + loff + pos * dim;
+    CHECK_HIP(hipMemcpyAsync(key_cache_row, s->k, dim * sizeof(float), hipMemcpyDeviceToDevice));
+    CHECK_HIP(hipMemcpyAsync(value_cache_row, s->v, dim * sizeof(float), hipMemcpyDeviceToDevice));
+    gpu_MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, head_size, loff, pos+1);
+
 
     // final matmul to get the output of the attention
     gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
