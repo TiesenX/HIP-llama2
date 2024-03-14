@@ -16,6 +16,7 @@
 #include <hip/hip_runtime.h>
 #include <omp.h>
 #include <math.h>
+#include "run.h"
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -31,67 +32,6 @@
 
 // ----------------------------------------------------------------------------
 // Transformer model
-
-typedef struct {
-  int dim; // transformer dimension
-  int hidden_dim; // for ffn layers
-  int n_layers; // number of layers
-  int n_heads; // number of query heads
-  int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-  int vocab_size; // vocabulary size, usually 256 (byte-level)
-  int seq_len; // max sequence length
-} Config;
-
-typedef struct {
-  // token embedding table
-  float* token_embedding_table;    // (vocab_size, dim)
-  // weights for rmsnorms
-  float* rms_att_weight; // (layer, dim) rmsnorm weights
-  float* rms_ffn_weight; // (layer, dim)
-  // weights for matmuls. note dim == n_heads * head_size
-  float* wq; // (layer, dim, n_heads * head_size)
-  float* wk; // (layer, dim, n_kv_heads * head_size)
-  float* wv; // (layer, dim, n_kv_heads * head_size)
-  float* wo; // (layer, n_heads * head_size, dim)
-  // weights for ffn
-  float* w1; // (layer, hidden_dim, dim)
-  float* w2; // (layer, dim, hidden_dim)
-  float* w3; // (layer, hidden_dim, dim)
-  // final rmsnorm
-  float* rms_final_weight; // (dim,)
-  // (optional) classifier weights for the logits, on the last layer
-  float* wcls;
-} TransformerWeights;
-
-typedef struct {
-  // current wave of activations
-  float *x; // activation at current time stamp (dim,)
-  float *xb; // same, but inside a residual branch (dim,)
-  float *xb2; // an additional buffer just for convenience (dim,)
-  float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-  float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-  float *q; // query (dim,)
-  float *k; // key (dim,)
-  float *v; // value (dim,)
-  float *att; // buffer for scores/attention values (n_heads, seq_len)
-  float *logits; // output logits
-
-  float *logits_gpu; // output logits
-  
-  // kv cache
-  float* key_cache;   // (layer, seq_len, dim)
-  float* value_cache; // (layer, seq_len, dim)
-} RunState;
-
-typedef struct {
-  Config config; // the hyperparameters of the architecture (the blueprint)
-  TransformerWeights weights; // the weights of the model
-  RunState state; // buffers for the "wave" of activations in the forward pass
-  // some more state needed to properly clean up the memory mapping (sigh)
-  int fd; // file descriptor for memory mapping
-  float* data; // memory mapped data pointer
-  ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
 
 
 // void malloc_run_state(RunState* s, Config* p) {
@@ -138,6 +78,58 @@ void malloc_run_state(RunState* s, Config* p) {
         exit(EXIT_FAILURE);
     }
 }
+
+void free_run_state(RunState* s) {
+    CHECK_HIP(hipFree(s->x));
+    CHECK_HIP(hipFree(s->xb));
+    CHECK_HIP(hipFree(s->xb2));
+    CHECK_HIP(hipFree(s->hb));
+    CHECK_HIP(hipFree(s->hb2));
+    CHECK_HIP(hipFree(s->q));
+    CHECK_HIP(hipFree(s->att));
+    CHECK_HIP(hipFree(s->logits_gpu));
+    CHECK_HIP(hipHostFree(s->logits));    
+    // free(s->logits);
+    CHECK_HIP(hipFree(s->key_cache));
+    CHECK_HIP(hipFree(s->value_cache));
+}
+
+#elif KERNEL_TEST
+void malloc_run_state(RunState* s, Config* p) {
+    // we calloc instead of malloc to keep valgrind happy
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    CHECK_HIP(hipHostMalloc((void**)&s->x, p->dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->xb, p->dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->xb2, p->dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->hb, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->q, p->dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+     || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
+        fprintf(stderr, "malloc failed!\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void free_run_state(RunState* s) {
+    CHECK_HIP(hipHostFree(s->x));
+    CHECK_HIP(hipHostFree(s->xb));
+    CHECK_HIP(hipHostFree(s->xb2));
+    CHECK_HIP(hipHostFree(s->hb));
+    CHECK_HIP(hipHostFree(s->hb2));
+    CHECK_HIP(hipHostFree(s->q));
+    CHECK_HIP(hipHostFree(s->att));
+    CHECK_HIP(hipHostFree(s->logits_gpu));
+    CHECK_HIP(hipHostFree(s->logits));    
+    CHECK_HIP(hipHostFree(s->key_cache));
+    CHECK_HIP(hipHostFree(s->value_cache));
+}
+
 #else
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
@@ -159,24 +151,6 @@ void malloc_run_state(RunState* s, Config* p) {
         exit(EXIT_FAILURE);
     }
 }
-#endif
-
-#ifdef USE_GPU
-void free_run_state(RunState* s) {
-    CHECK_HIP(hipFree(s->x));
-    CHECK_HIP(hipFree(s->xb));
-    CHECK_HIP(hipFree(s->xb2));
-    CHECK_HIP(hipFree(s->hb));
-    CHECK_HIP(hipFree(s->hb2));
-    CHECK_HIP(hipFree(s->q));
-    CHECK_HIP(hipFree(s->att));
-    CHECK_HIP(hipFree(s->logits_gpu));
-    CHECK_HIP(hipHostFree(s->logits));    
-    // free(s->logits);
-    CHECK_HIP(hipFree(s->key_cache));
-    CHECK_HIP(hipFree(s->value_cache));
-}
-#else
 void free_run_state(RunState* s) {
     free(s->x);
     free(s->xb);
@@ -249,6 +223,11 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     size_t weights_size = *file_size - sizeof(Config);
     CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
     CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
+#elif KERNEL_TEST
+    float* weights_ptr;
+    size_t weights_size = *file_size - sizeof(Config);
+    CHECK_HIP(hipHostMalloc((void**)&weights_ptr, weights_size, hipMemAllocationTypePinned));
+    CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
 #else
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
 #endif
@@ -285,13 +264,14 @@ void free_transformer(Transformer* t) {
     // we hipMalloc a region of memory, then hand the address to
     // the token_embedding_table field.  Free it here.
     CHECK_HIP(hipFree(t->weights.token_embedding_table));
+#elif KERNEL_TEST
+    CHECK_HIP(hipHostFree(t->weights.token_embedding_table));
 #endif
     // free the RunState buffers
     free_run_state(&t->state);
 }
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
-#ifdef USE_GPU
 
 __inline__ __device__
 float warpReduceSum(float val) {
@@ -386,11 +366,10 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int 
         }
     }
 }
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void gpu_rmsnorm(float* o, float* x, float* weight, int size) {
     int elementsPerThread = divUp(size, num_threads_lrg);
     rmsnorm_kernel <<<1, num_threads_lrg >>> (o, x, weight, size, elementsPerThread);
 }
-#else
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
   // calculate sum of squares
@@ -406,9 +385,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     o[j] = weight[j] * (ss * x[j]);
   }
 }
-#endif
 
-#ifdef USE_GPU
 __device__ void softmax_gpu(float* __restrict__ x, int size) {
     int tid = threadIdx.x;
     int step = blockDim.x;
@@ -446,7 +423,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
         x[i] /= sum;
     }
 }
-#endif
+
 void softmax(float* x, int size) {
   // find max value (for numerical stability)
   float max_val = x[0];
@@ -467,7 +444,6 @@ void softmax(float* x, int size) {
   }
 }
 
-#ifdef USE_GPU
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 
   // W (d,n) @ x (n,) -> xout (d,)
@@ -486,11 +462,11 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
   }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+void gpu_matmul(float* xout, float* x, float* w, int n, int d) {
   matmul_kernel<<<d, 512>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
 }
-#else
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
@@ -504,10 +480,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     xout[i] = val;
   }
 }
-#endif
 
-
-#ifdef USE_GPU
 __global__ void RoPE_kernel(int pos, float* sq, float* sk, 
                             int dim, int kv_dim, int head_size) {
   int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
@@ -527,14 +500,14 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
     vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
-void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) {
+void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) {
   dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  RoPE_kernel<<<grid, block>>>(pos, s->q, s->k, dim, kv_dim, head_size);
+  RoPE_kernel<<<grid, block>>>(pos, sq, sk, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
-#else
-void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) { //s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size) {
+
+void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) { //s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size) {
     for (int i = 0; i < dim; i+=2) {
         int head_dim = i % head_size;
         float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -543,7 +516,7 @@ void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) { //s->q, s-
         float fci = sinf(val);
         int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
         for (int v = 0; v < rotn; v++) {
-            float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
+            float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
             float v0 = vec[i];
             float v1 = vec[i+1];
             vec[i]   = v0 * fcr - v1 * fci;
@@ -551,9 +524,7 @@ void RoPE(RunState* s, int pos, int dim, int head_size, int kv_dim) { //s->q, s-
         }
     }
 }
-#endif
 
-#ifdef USE_GPU
 __global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
   int h = blockIdx.x;
   // get the query vector for this head
@@ -598,10 +569,10 @@ __global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float
     xb[i] = val;
   }
 }
-void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
+void gpu_MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
     MultiHeadAttention_kernel <<<p->n_heads, num_threads_lrg>>> (pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff);
 }
-#else
+
 void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
   int h;
   #pragma omp parallel for private(h)
@@ -642,9 +613,7 @@ void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul,
     }
   }
 }
-#endif
 
-#ifdef USE_GPU
 __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < hidden_dim) {
@@ -656,39 +625,36 @@ __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
         shb[i] = val;
     }
 }
-void swiglu(RunState *s, int hidden_dim) {
-    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med>>>(s->hb, s->hb2, hidden_dim);
+void gpu_swiglu(float *shb, float *shb2, int hidden_dim) {
+    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med>>>(shb, shb2, hidden_dim);
 }
-#else
-void swiglu(RunState *s, int hidden_dim) {
+
+void swiglu(float *shb, float *shb2, int hidden_dim) {
     for (int i = 0; i < hidden_dim; i++) {
-        float val = s->hb[i];
+        float val = shb[i];
         // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
         val *= (1.0f / (1.0f + expf(-val)));
         // elementwise multiply with w3(x)
-        val *= s->hb2[i];
-        s->hb[i] = val;
+        val *= shb2[i];
+        shb[i] = val;
     }
 }
-#endif
 
-#ifdef USE_GPU
 __global__ void accum_kernel(float* a, float* b, int size) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < size) {
       a[i] += b[i];
   }
 }
-void accum(float *a, float *b, int size) {
+void gpu_accum(float *a, float *b, int size) {
   accum_kernel<<<divUp(size, num_threads_med), num_threads_med>>>(a,b,size);
 }
-#else
+
 void accum(float *a, float *b, int size) {
   for (int i = 0; i < size; i++) {
     a[i] += b[i];
   }
 }
-#endif
 
 // ----------------------------------------------------------
 
@@ -717,6 +683,46 @@ float* forward(Transformer* transformer, int token, int pos) {
   for(unsigned long long l = 0; l < p->n_layers; l++) {
     // printf("Layer: %llu\n", l);
     // attention rmsnorm
+#ifdef USE_GPU
+    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+
+    // key and value point to the kv cache
+    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+    s->k = s->key_cache + loff + pos * kv_dim;
+    s->v = s->value_cache + loff + pos * kv_dim;
+
+    // qkv matmuls for this position
+    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim);
+
+    gpu_MultiHeadAttention(pos, p, s, kv_dim, kv_mul, head_size, loff);
+
+    // final matmul to get the output of the attention
+    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+
+    // residual connection back into x
+    gpu_accum(x, s->xb2, dim);
+
+    // ffn rmsnorm
+    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+
+    // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+    // first calculate self.w1(x) and self.w3(x)
+    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+
+    // SwiGLU non-linearity
+    gpu_swiglu(s->hb, s->hb2, hidden_dim);
+
+    // final matmul to get the output of the ffn
+    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+
+    // residual connection
+    gpu_accum(x, s->xb, dim);
+#else
     rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
     // key and value point to the kv cache
@@ -729,7 +735,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
-    RoPE(s, pos, dim, head_size, kv_dim);
+    RoPE(s->q, s->k, pos, dim, head_size, kv_dim);
 
     MultiHeadAttention(pos, p, s, kv_dim, kv_mul, head_size, loff);
 
@@ -748,22 +754,24 @@ float* forward(Transformer* transformer, int token, int pos) {
     matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
     // SwiGLU non-linearity
-    swiglu(s, hidden_dim);
+    swiglu(s->hb, s->hb2, hidden_dim);
 
     // final matmul to get the output of the ffn
     matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
     // residual connection
     accum(x, s->xb, dim);
+#endif 
   }
 
   // final rmsnorm
-  rmsnorm(x, x, w->rms_final_weight, dim);
-  // classifier into logits
 #ifdef USE_GPU
-  matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
+  gpu_rmsnorm(x, x, w->rms_final_weight, dim);
+  // classifier into logits
+  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
   CHECK_HIP(hipMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
 #else
+  rmsnorm(x, x, w->rms_final_weight, dim);
   matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
 #endif 
   return s->logits;
@@ -772,19 +780,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
-typedef struct {
-  char *str;
-  int id;
-} TokenIndex;
 
-typedef struct {
-  char** vocab;
-  float* vocab_scores;
-  TokenIndex *sorted_vocab;
-  int vocab_size;
-  unsigned int max_token_length;
-  unsigned char byte_pieces[512]; // stores all single-byte strings
-} Tokenizer;
 
 int compare_tokens(const void *a, const void *b) {
   return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
@@ -997,18 +993,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
-typedef struct {
-  float prob;
-  int index;
-} ProbIndex; // struct used when sorting probabilities during top-p sampling
 
-typedef struct {
-  int vocab_size;
-  ProbIndex* probindex; // buffer used in top-p sampling
-  float temperature;
-  float topp;
-  unsigned long long rng_state;
-} Sampler;
 
 int sample_argmax(float* probabilities, int n) {
   // return the index that has the highest probability
@@ -1159,13 +1144,6 @@ int sample_determin(const Sampler* sampler, float* logits, unsigned long long* r
   return next;
 }
 
-typedef struct {
-  int num_reqs;		// number of reqeusts;
-  int max_token_len;  // maximum size of token
-  int max_seq_len;	// maximum number of sequence
-  char* str_reqs;		// buffer for request strings
-  char* str_gens;		// buffer for generated strings
-} Requests;
 
 void build_requests(Requests* reqs, int num_reqs, int max_token_len, int max_seq_len) {
   reqs->num_reqs = num_reqs;
@@ -1572,7 +1550,7 @@ int multi_test(
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
-#ifndef TESTING
+// #ifndef TESTING
 
 void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
@@ -1595,6 +1573,7 @@ void error_usage() {
 }
 
 
+#ifndef KERNEL_TEST
 
 int main(int argc, char *argv[]) {
   printf("Enter main\n");

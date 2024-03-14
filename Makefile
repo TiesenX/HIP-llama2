@@ -11,6 +11,10 @@ runcpu: run.cc
 rungpu: run.cc
 	$(CC) -DUSE_GPU -o runcc run.cc -O2 --offload-arch=gfx908 -fopenmp
 
+.PHONY: test
+test: testing.cc run.cc
+	$(CC) -DKERNEL_TEST -o testcc testing.cc run.cc -O2 --offload-arch=gfx908 -fopenmp
+
 .PHONY: clean
 clean:
-	rm -f runcc
+	rm -f runcc testcc
