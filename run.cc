@@ -15,9 +15,11 @@
 
 #include <hip/hip_runtime.h>
 #include <omp.h>
+#include <pthread.h>
 #include <math.h>
 #include "run.h"
 
+#define USE_GPU 1
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
   do {                                                                                   \
@@ -215,22 +217,22 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
     *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-#ifdef USE_GPU
-    // allocate & copy mmap data to the gpu first
-    // TODO: allocate & copy just a portion to the GPU if the weights are too big
-    // to fit in the GPU, then copy the data only as needed while running.
-    float* weights_ptr;
-    size_t weights_size = *file_size - sizeof(Config);
-    CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
-    CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-#elif KERNEL_TEST
-    float* weights_ptr;
-    size_t weights_size = *file_size - sizeof(Config);
-    CHECK_HIP(hipHostMalloc((void**)&weights_ptr, weights_size, hipMemAllocationTypePinned));
-    CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-#else
+// #ifdef USE_GPU
+//     // allocate & copy mmap data to the gpu first
+//     // TODO: allocate & copy just a portion to the GPU if the weights are too big
+//     // to fit in the GPU, then copy the data only as needed while running.
+//     float* weights_ptr;
+//     size_t weights_size = *file_size - sizeof(Config);
+//     CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
+//     CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
+// #elif KERNEL_TEST
+//     float* weights_ptr;
+//     size_t weights_size = *file_size - sizeof(Config);
+//     CHECK_HIP(hipHostMalloc((void**)&weights_ptr, weights_size, hipMemAllocationTypePinned));
+//     CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
+// #else
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
-#endif
+// #endif
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
@@ -247,12 +249,31 @@ void print_transformer(Transformer* t) {
   printf("------------------------------------\n");
 }
 
+void initGPUWeights(Config* config, TransformerWeights* weights, float** data, ssize_t* file_size) {
+    float* weights_ptr;
+    size_t weights_size = *file_size - sizeof(Config);
+    int shared_weights = config->vocab_size > 0 ? 1 : 0; 
+    CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
+    CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
+}
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
   // read in the Config and the Weights from the checkpoint
   read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
   // allocate the RunState buffers
-  malloc_run_state(&t->state, &t->config);
+
+#pragma omp parallel for
+  for (int i = 0; i < MAX_GPU; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    initGPUWeights(&t->config, &t->weights_gpu[i], &t->data, &t->file_size);
+    printf("Malloced weights for GPU %d\n", i);
+    for (int j = 0; j < MAX_REQ; j++) {
+      malloc_run_state(&t->state[i][j], &t->config);
+      printf("Malloced run state for GPU %d, request %d\n", i, j);
+    }
+  }
+  
   print_transformer(t);
 }
 
@@ -260,37 +281,45 @@ void free_transformer(Transformer* t) {
     // close the memory mapping
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
     if (t->fd != -1) { close(t->fd); }
-#ifdef USE_GPU
-    // we hipMalloc a region of memory, then hand the address to
-    // the token_embedding_table field.  Free it here.
-    CHECK_HIP(hipFree(t->weights.token_embedding_table));
-#elif KERNEL_TEST
-    CHECK_HIP(hipHostFree(t->weights.token_embedding_table));
-#endif
+// #ifdef USE_GPU
+//     // we hipMalloc a region of memory, then hand the address to
+//     // the token_embedding_table field.  Free it here.
+//     CHECK_HIP(hipFree(t->weights.token_embedding_table));
+// #elif KERNEL_TEST
+//     CHECK_HIP(hipHostFree(t->weights.token_embedding_table));
+// #endif
     // free the RunState buffers
-    free_run_state(&t->state);
+    #pragma omp parallel for
+    for (int i=0; i<MAX_GPU; i++) {
+        CHECK_HIP(hipSetDevice(i));
+        CHECK_HIP(hipFree(t->weights_gpu[i].token_embedding_table));
+        for (int j=0; j<MAX_REQ; j++) {
+          free_run_state(&t->state[i][j]);
+        }
+    }
 }
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
 __inline__ __device__
 float warpReduceSum(float val) {
-  for (int offset = warpSize/2; offset > 0; offset /= 2) 
+  for (int offset = warpSize/2; offset > 0; offset >>= 1) 
     val += __shfl_down(val, offset);
   return val;
 }
 
 __inline__ __device__
 float warpReduceMax(float val) {
-  for (int offset = warpSize/2; offset > 0; offset /= 2) 
+  for (int offset = warpSize/2; offset > 0; offset >>= 1) 
     val = max(val, __shfl_down(val, offset));
   return val;
 }
 
+#define WARP_SIZE 64
 __inline__ __device__
 float blockReduceSum(float val) {
 
-  static __shared__ float shared[16]; // Shared mem for 16 partial sums
+  static __shared__ float shared[WARP_SIZE]; // Shared mem for 16 partial sums
   int lane = threadIdx.x % warpSize;
   int wid = threadIdx.x / warpSize;
 
@@ -301,7 +330,7 @@ float blockReduceSum(float val) {
   __syncthreads();              // Wait for all partial reductions
 
   //read from shared memory only if that warp existed
-  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0.0f;
+  val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
 
   if (wid==0) val = warpReduceSum(val); //Final reduce within first warp
 
@@ -311,7 +340,7 @@ float blockReduceSum(float val) {
 __inline__ __device__
 float blockReduceMax(float val) {
 
-  static __shared__ float shared[16]; // Shared mem for 16 partial max values
+  static __shared__ float shared[WARP_SIZE]; // Shared mem for 16 partial max values
   int lane = threadIdx.x % warpSize;
   int wid = threadIdx.x / warpSize;
 
@@ -322,7 +351,7 @@ float blockReduceMax(float val) {
   __syncthreads();              // Wait for all partial reductions
 
   //read from shared memory only if that warp existed
-  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0.0f;
+  val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
 
   if (wid==0) val = warpReduceMax(val); //Final reduce within first warp
 
@@ -337,13 +366,14 @@ int divUp(int a, int b) {
 const int num_threads_lrg = 1024;
 const int num_threads_med = 256;
 
-__global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int elementsPerThread) {
+__global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size) {
     // parallel reduction of sum of squares via CUB
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
     float ss = 0.0f;
-    for (int i = 0; i < elementsPerThread; i++) {
-        int j = threadIdx.x + i * num_threads_lrg;
-        if (j < size)
-            ss += x[j] * x[j];
+    for (int i = tid; i < size; i+=num_threads) {
+        ss += x[i] * x[i];
     }
     ss = blockReduceSum(ss);
 
@@ -359,16 +389,12 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size, int 
     ss = shared_ss;
 
     // normalize and scale
-    for (int i = 0; i < elementsPerThread; i++) {
-        int j = threadIdx.x + i * num_threads_lrg;
-        if (j < size) {
-            o[j] = weight[j] * (ss * x[j]);
-        }
+    for (int i = tid; i < size; i+=num_threads) {
+        o[i] = weight[i] * (ss * x[i]);
     }
 }
-void gpu_rmsnorm(float* o, float* x, float* weight, int size) {
-    int elementsPerThread = divUp(size, num_threads_lrg);
-    rmsnorm_kernel <<<1, num_threads_lrg >>> (o, x, weight, size, elementsPerThread);
+void gpu_rmsnorm(float* o, float* x, float* weight, int size, hipStream_t *stream) {
+    rmsnorm_kernel <<<1, num_threads_lrg, 0, *stream >>> (o, x, weight, size);
 }
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
@@ -462,8 +488,8 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
   }
 }
 
-void gpu_matmul(float* xout, float* x, float* w, int n, int d) {
-  matmul_kernel<<<d, 512>>>(xout, x, w, n, d);
+void gpu_matmul(float* xout, float* x, float* w, int n, int d, hipStream_t *stream) {
+  matmul_kernel<<<d, 512, 0, *stream>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
 }
 
@@ -500,10 +526,10 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
     vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
-void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) {
+void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, hipStream_t *stream) {
   dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  RoPE_kernel<<<grid, block>>>(pos, sq, sk, dim, kv_dim, head_size);
+  RoPE_kernel<<<grid, block, 0, *stream>>>(pos, sq, sk, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
 
@@ -610,9 +636,9 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // MultiHeadAttention_kernel <<<p->n_heads, num_threads_lrg>>> (pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff, head_size * p->n_heads);
 // }
 
-void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int head_size, int loff, int seq_len) {
+void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int head_size, int loff, int seq_len, hipStream_t *stream) {
     int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg>>> (output, q, key_cache, value_cache, num_heads, head_size, loff, seq_len, dim);
+    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg, 0, *stream>>> (output, q, key_cache, value_cache, num_heads, head_size, loff, seq_len, dim);
 }
 
 void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
@@ -667,8 +693,8 @@ __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
         shb[i] = val;
     }
 }
-void gpu_swiglu(float *shb, float *shb2, int hidden_dim) {
-    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med>>>(shb, shb2, hidden_dim);
+void gpu_swiglu(float *shb, float *shb2, int hidden_dim, hipStream_t *stream) {
+    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, *stream>>>(shb, shb2, hidden_dim);
 }
 
 void swiglu(float *shb, float *shb2, int hidden_dim) {
@@ -688,8 +714,8 @@ __global__ void accum_kernel(float* a, float* b, int size) {
       a[i] += b[i];
   }
 }
-void gpu_accum(float *a, float *b, int size) {
-  accum_kernel<<<divUp(size, num_threads_med), num_threads_med>>>(a,b,size);
+void gpu_accum(float *a, float *b, int size, hipStream_t *stream) {
+  accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, *stream>>>(a,b,size);
 }
 
 void accum(float *a, float *b, int size) {
@@ -700,12 +726,12 @@ void accum(float *a, float *b, int size) {
 
 // ----------------------------------------------------------
 
-float* forward(Transformer* transformer, int token, int pos) {
+float* forward(Transformer* transformer, int token, int pos, int device_id, int thread_id, hipStream_t *stream) {
 
   // a few convenience variables
   Config* p = &transformer->config;
-  TransformerWeights* w = &transformer->weights;
-  RunState* s = &transformer->state;
+  TransformerWeights* w = &transformer->weights_gpu[device_id];
+  RunState* s = &transformer->state[device_id][thread_id];
   float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -716,7 +742,8 @@ float* forward(Transformer* transformer, int token, int pos) {
   // copy the token embedding into x
   float* content_row = w->token_embedding_table + token * dim;
 #ifdef USE_GPU
-  CHECK_HIP(hipMemcpy(x, content_row, dim*sizeof(*x), hipMemcpyHostToDevice));
+  CHECK_HIP(hipMemcpyAsync(x, content_row, dim*sizeof(*x), hipMemcpyHostToDevice, *stream));
+  CHECK_HIP(hipStreamSynchronize(*stream));
 #else
   memcpy(x, content_row, dim*sizeof(*x));
 #endif
@@ -726,7 +753,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     // printf("Layer: %llu\n", l);
     // attention rmsnorm
 #ifdef USE_GPU
-    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, stream);
 
     // key and value point to the kv cache
     int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -734,42 +761,42 @@ float* forward(Transformer* transformer, int token, int pos) {
     s->v = s->value_cache + loff + pos * kv_dim;
 
     // qkv matmuls for this position
-    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, stream);
+    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, stream);
+    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, stream);
 
-    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim);
+    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, stream);
 
     // save key,value at this time step (pos) to our kv cache
     float* key_cache_row = s->key_cache + loff + pos * dim;
     float* value_cache_row = s->value_cache + loff + pos * dim;
-    CHECK_HIP(hipMemcpyAsync(key_cache_row, s->k, dim * sizeof(float), hipMemcpyDeviceToDevice));
-    CHECK_HIP(hipMemcpyAsync(value_cache_row, s->v, dim * sizeof(float), hipMemcpyDeviceToDevice));
-    gpu_MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, head_size, loff, pos+1);
+    CHECK_HIP(hipMemcpyAsync(key_cache_row, s->k, dim * sizeof(float), hipMemcpyDeviceToDevice, *stream));
+    CHECK_HIP(hipMemcpyAsync(value_cache_row, s->v, dim * sizeof(float), hipMemcpyDeviceToDevice, *stream));
+    gpu_MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, p->n_heads, head_size, loff, pos+1, stream);
 
 
     // final matmul to get the output of the attention
-    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, stream);
 
     // residual connection back into x
-    gpu_accum(x, s->xb2, dim);
+    gpu_accum(x, s->xb2, dim, stream);
 
     // ffn rmsnorm
-    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, stream);
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
-    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, stream);
+    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, stream);
 
     // SwiGLU non-linearity
-    gpu_swiglu(s->hb, s->hb2, hidden_dim);
+    gpu_swiglu(s->hb, s->hb2, hidden_dim, stream);
 
     // final matmul to get the output of the ffn
-    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, stream);
 
     // residual connection
-    gpu_accum(x, s->xb, dim);
+    gpu_accum(x, s->xb, dim, stream);
 #else
     rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
@@ -814,10 +841,10 @@ float* forward(Transformer* transformer, int token, int pos) {
 
   // final rmsnorm
 #ifdef USE_GPU
-  gpu_rmsnorm(x, x, w->rms_final_weight, dim);
+  gpu_rmsnorm(x, x, w->rms_final_weight, dim, stream);
   // classifier into logits
-  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
-  CHECK_HIP(hipMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size, stream);
+  CHECK_HIP(hipMemcpyAsync(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost, *stream));
 #else
   rmsnorm(x, x, w->rms_final_weight, dim);
   matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
@@ -858,6 +885,13 @@ void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
     t->vocab[i][len] = '\0'; // add the string terminating token
   }
   fclose(file);
+  // lazily malloc and sort the vocabulary
+  t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
+  for (int i = 0; i < t->vocab_size; i++) {
+    t->sorted_vocab[i].str = t->vocab[i];
+    t->sorted_vocab[i].id = i;
+  }
+  qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
 }
 
 void free_tokenizer(Tokenizer* t) {
@@ -921,15 +955,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
   // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
   if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
 
-  if (t->sorted_vocab == NULL) {
-    // lazily malloc and sort the vocabulary
-    t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
-    for (int i = 0; i < t->vocab_size; i++) {
-      t->sorted_vocab[i].str = t->vocab[i];
-      t->sorted_vocab[i].id = i;
-    }
-    qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
-  }
+
 
   // create a temporary buffer that will store merge candidates of always two consecutive tokens
   // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
@@ -1280,66 +1306,6 @@ long time_in_ms() {
   return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-// ----------------------------------------------------------------------------
-// generation loop
-
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-  char *empty_prompt = (char*)"";
-  if (prompt == NULL) { prompt = empty_prompt; }
-
-  // encode the (string) prompt into tokens sequence
-  int num_prompt_tokens = 0;
-  int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-  if (num_prompt_tokens < 1) {
-    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // start the main loop
-  long start = 0;  // used to time our code, only initialized after first iteration
-  int next;        // will store the next token in the sequence
-  int token = prompt_tokens[0]; // kick off with the first token in the prompt
-  int pos = 0;     // position in the sequence
-  while (pos < steps) {
-    // forward the transformer to get logits for the next token
-    float* logits = forward(transformer, token, pos);
-
-    // advance the state machine
-    if (pos < num_prompt_tokens - 1) {
-      // if we are still processing the input prompt, force the next prompt token
-      next = prompt_tokens[pos + 1];
-    } else {
-      // otherwise sample the next token from the logits
-      next = sample(sampler, logits);
-    }
-    pos++;
-
-    // data-dependent terminating condition: the BOS (=1) token delimits sequences
-    if (next == 1) { 
-      break;
-    }
-
-    // print the token as string, decode it with the Tokenizer object
-    char* piece = decode(tokenizer, token, next);
-    safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-    fflush(stdout);
-    token = next;
-
-    // init the timer here because the first iteration can be slower
-    if (start == 0) { start = time_in_ms(); }
-
-  }
-  printf("\n");
-
-  // report achieved tok/s (pos-1 because the timer starts after first iteration)
-  if (pos > 1) {
-    long end = time_in_ms();
-    fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
-  }
-
-  free(prompt_tokens);
-}
 
 void read_stdin(const char* guide, char* buffer, size_t bufsize) {
   // read a line from stdin, up to but not including \n
@@ -1352,114 +1318,61 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
   }
 }
 
-// ----------------------------------------------------------------------------
-// chat loop
-// I manually inspected the tokens for a few chat conversations compared to
-// python reference and that seemed ok, but this was not thoroughly tested and
-// is not safely implemented, it's more a proof of concept atm.
+static hipStream_t streams[MAX_GPU][MAX_REQ];
+static size_t rStart[MAX_GPU][MAX_REQ], rEnd[MAX_GPU][MAX_REQ];
+static size_t num_reqs[MAX_GPU];
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-    char *cli_user_prompt, char *cli_system_prompt, int steps) {
 
-  // buffers for reading the system prompt and user prompt from stdin
-  // you'll notice they are soomewhat haphazardly and unsafely set atm
-  char system_prompt[512];
-  char user_prompt[512];
-  char rendered_prompt[1152];
-  int num_prompt_tokens = 0;
-  int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
-  int user_idx;
-
-  // start the main loop
-  int8_t user_turn = 1; // user starts
-  int next;        // will store the next token in the sequence
-  int token;       // stores the current token to feed into the transformer
-  int prev_token;
-  int pos = 0;     // position in the sequence
-  while (pos < steps) {
-
-    // when it is the user's turn to contribute tokens to the dialog...
-    if (user_turn) {
-      // get the (optional) system prompt at position 0
-      if (pos == 0) {
-        // at position 0, the user can also contribute a system prompt
-        if (cli_system_prompt == NULL) {
-          // system prompt was not passed in, attempt to get it from stdin
-          read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
-        } else {
-          // system prompt was passed in, use it
-          strcpy(system_prompt, cli_system_prompt);
-        }
-      }
-      // get the user prompt
-      if (pos == 0 && cli_user_prompt != NULL) {
-        // user prompt for position 0 was passed in, use it
-        strcpy(user_prompt, cli_user_prompt);
-      } else {
-        // otherwise get user prompt from stdin
-        read_stdin("User: ", user_prompt, sizeof(user_prompt));
-      }
-      // render user/system prompts into the Llama 2 Chat schema
-      if (pos == 0 && system_prompt[0] != '\0') {
-        char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
-        sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
-      } else {
-        char user_template[] = "[INST] %s [/INST]";
-        sprintf(rendered_prompt, user_template, user_prompt);
-      }
-      // encode the rendered prompt into tokens
-      encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-      user_idx = 0; // reset the user index
-      user_turn = 0;
-      printf("Assistant: ");
+void initStreams(int num_gpu, int num_reqs) {
+  for(int i = 0; i < num_gpu; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    for(int j = 0; j < MAX_REQ; j++) {
+      CHECK_HIP(hipStreamCreate(&streams[i][j]));
     }
-
-    // determine the token to pass into the transformer next
-    if (user_idx < num_prompt_tokens) {
-      // if we are still processing the input prompt, force the next prompt token
-      token = prompt_tokens[user_idx++];
-    } else {
-      // otherwise use the next token sampled from previous turn
-      token = next;
-    }
-    // EOS (=2) token ends the Assistant turn
-    if (token == 2) { user_turn = 1; }
-
-    // forward the transformer to get logits for the next token
-    float* logits = forward(transformer, token, pos);
-    next = sample(sampler, logits);
-    pos++;
-
-    if (user_idx >= num_prompt_tokens && next != 2) {
-      // the Assistant is responding, so print its output
-      char* piece = decode(tokenizer, token, next);
-      safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-      fflush(stdout);
-    }
-    if (next == 2) { printf("\n"); }
   }
-  printf("\n");
-  free(prompt_tokens);
 }
 
-// ----------------------------------------------------------------------------
-// You should parallelize and optimize from this function exploiting multiple GPUs
-//
-int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1, int start_idx=0, int end_idx=0) {
-  // Count the number of the generated tokens
-  int gen_cnt = 0;
-
-  // Avoid randomness to generate tokens for batch input
-  // Each input request has its Sampler each
-  Sampler samplers[requests->num_reqs];
-  for(int idx = start_idx; idx < end_idx; idx++) {
-    build_sampler(&samplers[idx], transformer->config.vocab_size, 1.0f, 0.9f, 314028);
+void destroyStreams(int num_gpu, int num_reqs) {
+  for(int i = 0; i < num_gpu; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    for(int j = 0; j < MAX_REQ; j++) {
+      CHECK_HIP(hipStreamDestroy(streams[i][j]));
+    }
   }
+}
 
-  // Loop for the multiple requests
-  for(int idx = start_idx; idx < end_idx; idx++) {
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+int cnt_threads[MAX_GPU][MAX_REQ];
+
+void* test_worker(void* args) {
+  // printf("adhashdjashdkjahsd");
+  thread_args* targs = (thread_args*)args;
+  Transformer* transformer = targs->transformer;
+  Tokenizer* tokenizer = targs->tokenizer;
+  Requests* requests = targs->requests;
+  int device_id = targs->device_id;
+  int thread_id = targs->thread_id;
+  int *next_req = targs->next_req;
+
+  int current_req;
+  int gen_cnt = 0;
+  
+  while(true) {
+    pthread_mutex_lock(&mutex);
+    current_req = *next_req;
+    *next_req = *next_req + 1;
+    pthread_mutex_unlock(&mutex);
+    if (current_req >= targs->total_reqs) {
+      break;
+    }
+    // Avoid randomness to generate tokens for batch input
+    // Each input request has its Sampler each
+    Sampler sampler;
+    build_sampler(&sampler, transformer->config.vocab_size, 1.0f, 0.9f, 314028);
+    // Loop for the multiple requests
     std::string gen_str = "";
-    char* prompt = get_str_req_ptr(requests, idx);
+    char* prompt = get_str_req_ptr(requests, current_req);
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
 
     // encode the (string) prompt into tokens sequence
@@ -1475,11 +1388,13 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
+    
     int steps = requests->max_seq_len; // max sequence length
     while (pos < steps) {
       // forward the transformer to get logits for the next token
       // printf("\npos: %d, token: %d\n", pos, token);
-      float* logits = forward(transformer, token, pos);
+      float* logits = forward(transformer, token, pos, device_id, thread_id, &streams[device_id][thread_id]);
+      CHECK_HIP(hipStreamSynchronize(streams[device_id][thread_id]));
       // printf("Pass forward\n");
       // advance the state machine
       if (pos < num_prompt_tokens - 1) {
@@ -1487,14 +1402,14 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
         next = prompt_tokens[pos + 1];
       } else {
         // otherwise sample the next token from the logits
-        next = sample(&samplers[idx], logits);
+        next = sample(&sampler, logits);
         //next = sample_greedy(sampler, logits);
         //next = sample_determin(sampler, logits, rng_states, idx);
       }
       pos++;
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
-      if (next == 1) { 
+      if (next == 1 || next == 2) { 
         break;
       }
 
@@ -1502,7 +1417,7 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
       char* piece = decode(tokenizer, token, next);
       // You don't need to print every tokens are generated.
       // {
-      safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+      // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
       fflush(stdout);
       // }
       // gen_str += piece;
@@ -1513,10 +1428,10 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
       if (start == 0) { start = time_in_ms(); }
 
     }
-    printf("\n");
+    // printf("\n");
 
     gen_str += "\n";
-    strcpy(get_str_gen_ptr(requests, idx), gen_str.c_str());
+    strcpy(get_str_gen_ptr(requests, current_req), gen_str.c_str());
     free(prompt_tokens);
 
     // report achieved tok/s (pos-1 because the timer starts after first iteration)
@@ -1526,74 +1441,81 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
       gen_cnt += pos-1;
     }
     printf("End of the request\n");
-  }
 
-  for(int idx = start_idx; idx < end_idx; idx++) {
-    free_sampler(&samplers[idx]);
+    // for(int idx = start_idx; idx < end_idx; idx++) {
+    free_sampler(&sampler);
+    // }
+    // return gen_cnt;
   }
-  return gen_cnt;
+  cnt_threads[device_id][thread_id] = gen_cnt;
+  return NULL; 
 }
 
+// ----------------------------------------------------------------------------
+// You should parallelize and optimize from this function exploiting multiple GPUs
+//
 
-int multi_test(
-  Requests* requests,
-  char* checkpoint_path=NULL,
-  char* tokenizer_path = (char*)"tokenizer.bin",
-  float temperature=1.0f,
-  float topp=0.9f,
-  int steps=256,
-  unsigned long long rng_seed=0,
-  char* input_filename=NULL,
-  char* output_filename=NULL,
-  int batch=1) { 
+
+int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1) {
+  // Count the number of the generated tokens
+  int gen_cnt = 0;
+  int num_reqs = requests->num_reqs;
+  int* next_req = (int*)malloc(sizeof(int));
+  
+  *next_req = 0; // global request index
+
+  thread_args args[MAX_GPU][MAX_REQ];
+  pthread_t threads[MAX_GPU][MAX_REQ];
+  pthread_attr_t attr[MAX_GPU][MAX_REQ];
+  cpu_set_t cpus[MAX_GPU][MAX_REQ];
 
   int numDevices;
   CHECK_HIP(hipGetDeviceCount(&numDevices));
+  printf("Number of Devices: %d\n", numDevices);
+  printf("num_reqs: %d\n", num_reqs);
 
-  int *num_gen_tokens = (int*)malloc(numDevices * sizeof(int));
-#pragma omp parallel for num_threads(numDevices) schedule(static) shared(num_gen_tokens, requests)
-  for (int d=0; d<numDevices; d++) {
-    int device = omp_get_thread_num();
-    CHECK_HIP(hipSetDevice(device));
+  for (int i=0; i<numDevices; i++) {
+    // CHECK_HIP(hipSetDevice(i));
+    for (int j=0; j<MAX_REQ; j++) {
 
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
+      args[i][j].transformer = transformer;
+      args[i][j].tokenizer = tokenizer;
+      args[i][j].requests = requests;
+      args[i][j].thread_id = j;
+      args[i][j].device_id = i;
+      args[i][j].total_reqs = num_reqs;
+      args[i][j].next_req = next_req;
 
-    // build the Tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+      printf("args next_req: %d\n", *args[i][j].next_req);
 
-    // build the Sampler
-    Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
-    
-    // Split the requests into the number of devices
-    printf("Build transformers from GPU %d\n", device);
+      pthread_attr_init(&attr[i][j]);
+      CPU_ZERO(&cpus[i][j]);
+      CPU_SET(i * MAX_REQ + j, &cpus[i][j]);
 
-    steps = transformer.config.seq_len;
+      pthread_attr_setaffinity_np(&attr[i][j], sizeof(cpu_set_t), &cpus[i][j]);
 
-    if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, requests)) {
-      fprintf(stderr, "cannot read input file: %s\n", input_filename);
-      exit(EXIT_FAILURE);
+      int rc = pthread_create(&threads[i][j], &attr[i][j], test_worker, args[i] + j);
+      if (rc) {
+        printf("ERROR; return code from pthread_create() is %d\n", rc);
+        exit(-1);
+      }
     }
-
-    int total_reqs = requests->num_reqs;
-
-    int start = total_reqs / numDevices * device;
-    int end = total_reqs / numDevices * (device + 1);
-    if (device == numDevices - 1) end = total_reqs;
-    num_gen_tokens[device] = test(&transformer, &tokenizer, requests, batch, start, end);
   }
 
-  int gen_cnt = 0;
-  for (int i = 0; i<numDevices; i++) {
-    gen_cnt += num_gen_tokens[i];
+  for (int i=0; i<numDevices; i++) {
+    for (int j=0; j<MAX_REQ; j++) {
+      pthread_join(threads[i][j], NULL);
+    }
   }
 
+  for (int i=0; i<numDevices; i++) {
+    for (int j=0; j<MAX_REQ; j++) {
+      gen_cnt += cnt_threads[i][j];
+    }
+  }
   return gen_cnt;
-
 }
+
 
 
 // ----------------------------------------------------------------------------
@@ -1668,17 +1590,19 @@ int main(int argc, char *argv[]) {
   if (steps < 0) steps = 0;
 
   // build the Transformer via the model .bin file
-  // Transformer transformer;
-  // build_transformer(&transformer, checkpoint_path);
-  // if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
-  // // build the Tokenizer via the tokenizer .bin file
-  // Tokenizer tokenizer;
-  // build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+  initStreams(MAX_GPU, MAX_REQ);
+  Transformer transformer;
+  build_transformer(&transformer, checkpoint_path);
+  if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
-  // // build the Sampler
-  // Sampler sampler;
-  // build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+  // build the Tokenizer via the tokenizer .bin file
+  Tokenizer tokenizer;
+  build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+
+  // build the Sampler
+  Sampler sampler;
+  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
   Requests requests;
 
@@ -1690,25 +1614,23 @@ int main(int argc, char *argv[]) {
     //chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
   } 
   else if  (strcmp(mode, "test") == 0) {
-    // int num_reqs;
-    // steps = transformer.config.seq_len;
+    int num_reqs;
+    steps = transformer.config.seq_len;
     if(input_filename == NULL || output_filename == NULL) {
       error_usage();
     }
-    // if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, &requests)) {
-    //   fprintf(stderr, "cannot read input file: %s\n", input_filename);
-    //   exit(EXIT_FAILURE);
-    // }
+    if(EXIT_FAILURE == read_inputfile(input_filename, tokenizer.max_token_length, steps, &requests)) {
+      fprintf(stderr, "cannot read input file: %s\n", input_filename);
+      exit(EXIT_FAILURE);
+    }
 
     // Don't modify this parts for evaluation
     // {
     long start, end;
     start = time_in_ms();
-    // int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch, 0, requests.num_reqs);
-    // printf("Prepare to run\n");
-    int num_gen_tokens = multi_test(&requests,
-      checkpoint_path, tokenizer_path, temperature, topp, steps, rng_seed, input_filename, output_filename, 
-      batch);
+    // int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch);
+    int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch);
+  //   // printf("Prepare to run\n");
     end = time_in_ms();
 
     // Your goal is to achieve best throughput(=reduce elapsed time)! 
@@ -1727,7 +1649,8 @@ int main(int argc, char *argv[]) {
     error_usage();
   }
 
-  // memory and file handles cleanup
+  destroyStreams(MAX_GPU, MAX_REQ);
+  // // memory and file handles cleanup
   // free_sampler(&sampler);
   // free_tokenizer(&tokenizer);
   // free_transformer(&transformer);
