@@ -17,9 +17,9 @@
 #include <omp.h>
 #include <pthread.h>
 #include <math.h>
-#include "run.h"
+#include "build.h"
+#include "kernels.h"
 
-#define USE_GPU 1
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
   do {                                                                                   \
@@ -32,699 +32,10 @@
     }                                                                                    \
   } while (0)
 
+#define USE_GPU 1
+
 // ----------------------------------------------------------------------------
-// Transformer model
-
-
-// void malloc_run_state(RunState* s, Config* p) {
-//   // we calloc instead of malloc to keep valgrind happy
-//   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-//   s->x = (float*)calloc(p->dim, sizeof(float));
-//   s->xb = (float*)calloc(p->dim, sizeof(float));
-//   s->xb2 = (float*)calloc(p->dim, sizeof(float));
-//   s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
-//   s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
-//   s->q = (float*)calloc(p->dim, sizeof(float));
-//   s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-//   s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-//   s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
-//   s->logits = (float*)calloc(p->vocab_size, sizeof(float));
-//   // ensure all mallocs went fine
-//   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-//       || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-//     fprintf(stderr, "malloc failed!\n");
-//     exit(EXIT_FAILURE);
-//   }
-// }
-
-#ifdef USE_GPU
-void malloc_run_state(RunState* s, Config* p) {
-    // we calloc instead of malloc to keep valgrind happy
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    CHECK_HIP(hipMalloc((void**)&s->x, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->xb, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->xb2, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->hb, p->hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->q, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float)));
-    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
-    // s->logits = (float *)calloc(p->vocab_size, sizeof(float));
-    // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
-        fprintf(stderr, "malloc failed!\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void free_run_state(RunState* s) {
-    CHECK_HIP(hipFree(s->x));
-    CHECK_HIP(hipFree(s->xb));
-    CHECK_HIP(hipFree(s->xb2));
-    CHECK_HIP(hipFree(s->hb));
-    CHECK_HIP(hipFree(s->hb2));
-    CHECK_HIP(hipFree(s->q));
-    CHECK_HIP(hipFree(s->att));
-    CHECK_HIP(hipFree(s->logits_gpu));
-    CHECK_HIP(hipHostFree(s->logits));    
-    // free(s->logits);
-    CHECK_HIP(hipFree(s->key_cache));
-    CHECK_HIP(hipFree(s->value_cache));
-}
-
-#elif KERNEL_TEST
-void malloc_run_state(RunState* s, Config* p) {
-    // we calloc instead of malloc to keep valgrind happy
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    CHECK_HIP(hipHostMalloc((void**)&s->x, p->dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->xb, p->dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->xb2, p->dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->hb, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->q, p->dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
-    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
-        fprintf(stderr, "malloc failed!\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void free_run_state(RunState* s) {
-    CHECK_HIP(hipHostFree(s->x));
-    CHECK_HIP(hipHostFree(s->xb));
-    CHECK_HIP(hipHostFree(s->xb2));
-    CHECK_HIP(hipHostFree(s->hb));
-    CHECK_HIP(hipHostFree(s->hb2));
-    CHECK_HIP(hipHostFree(s->q));
-    CHECK_HIP(hipHostFree(s->att));
-    CHECK_HIP(hipHostFree(s->logits_gpu));
-    CHECK_HIP(hipHostFree(s->logits));    
-    CHECK_HIP(hipHostFree(s->key_cache));
-    CHECK_HIP(hipHostFree(s->value_cache));
-}
-
-#else
-void malloc_run_state(RunState* s, Config* p) {
-    // we calloc instead of malloc to keep valgrind happy
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = (float *)calloc(p->dim, sizeof(float));
-    s->xb = (float *)calloc(p->dim, sizeof(float));
-    s->xb2 = (float *)calloc(p->dim, sizeof(float));
-    s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
-    s->q = (float *)calloc(p->dim, sizeof(float));
-    s->key_cache = (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = (float *)calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = (float *)calloc(p->vocab_size, sizeof(float));
-    // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
-        fprintf(stderr, "malloc failed!\n");
-        exit(EXIT_FAILURE);
-    }
-}
-void free_run_state(RunState* s) {
-    free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->q);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
-}
-#endif
-
-void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
-  int head_size = p->dim / p->n_heads;
-  // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
-  unsigned long long n_layers = p->n_layers;
-  w->token_embedding_table = ptr;
-  ptr += p->vocab_size * p->dim;
-  w->rms_att_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->wq = ptr;
-  ptr += n_layers * p->dim * (p->n_heads * head_size);
-  w->wk = ptr;
-  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-  w->wv = ptr;
-  ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
-  w->wo = ptr;
-  ptr += n_layers * (p->n_heads * head_size) * p->dim;
-  w->rms_ffn_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->w1 = ptr;
-  ptr += n_layers * p->dim * p->hidden_dim;
-  w->w2 = ptr;
-  ptr += n_layers * p->hidden_dim * p->dim;
-  w->w3 = ptr;
-  ptr += n_layers * p->dim * p->hidden_dim;
-  w->rms_final_weight = ptr;
-  ptr += p->dim;
-  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-  ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
-  w->wcls = shared_weights ? w->token_embedding_table : ptr;
-}
-
-
-void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
-                     int* fd, float** data, ssize_t* file_size) {
-    FILE *file = fopen(checkpoint, "rb");
-    if (!file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
-    // read in the config header
-    if (fread(config, sizeof(Config), 1, file) != 1) { exit(EXIT_FAILURE); }
-    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
-    int shared_weights = config->vocab_size > 0 ? 1 : 0;
-    config->vocab_size = abs(config->vocab_size);
-    // figure out the file size
-    fseek(file, 0, SEEK_END); // move file pointer to end of file
-    *file_size = ftell(file); // get the file size, in bytes
-    fclose(file);
-    // memory map the Transformer weights into the data pointer
-    *fd = open(checkpoint, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-// #ifdef USE_GPU
-//     // allocate & copy mmap data to the gpu first
-//     // TODO: allocate & copy just a portion to the GPU if the weights are too big
-//     // to fit in the GPU, then copy the data only as needed while running.
-//     float* weights_ptr;
-//     size_t weights_size = *file_size - sizeof(Config);
-//     CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
-//     CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-// #elif KERNEL_TEST
-//     float* weights_ptr;
-//     size_t weights_size = *file_size - sizeof(Config);
-//     CHECK_HIP(hipHostMalloc((void**)&weights_ptr, weights_size, hipMemAllocationTypePinned));
-//     CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-// #else
-    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
-// #endif
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
-}
-
-void print_transformer(Transformer* t) {
-  printf("---------Model Information----------\n");
-  printf("dim: %d\n", t->config.dim);
-  printf("hidden_dim: %d\n", t->config.hidden_dim);
-  printf("n_layers: %d\n", t->config.n_layers);
-  printf("n_heads: %d\n", t->config.n_heads);
-  printf("n_kv_heads: %d\n", t->config.n_kv_heads);
-  printf("vocab_size: %d\n", t->config.vocab_size);
-  printf("seq_len: %d\n", t->config.seq_len);
-  printf("weights_size: %lu MB\n", (t->file_size - sizeof(Config)) / (1024L*1024L));
-  printf("------------------------------------\n");
-}
-
-void initGPUWeights(Config* config, TransformerWeights* weights, float** data, ssize_t* file_size) {
-    float* weights_ptr;
-    size_t weights_size = *file_size - sizeof(Config);
-    int shared_weights = config->vocab_size > 0 ? 1 : 0; 
-    CHECK_HIP(hipMalloc((void**)&weights_ptr, weights_size));
-    CHECK_HIP(hipMemcpy(weights_ptr, *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-    memory_map_weights(weights, config, weights_ptr, shared_weights);
-}
-
-void build_transformer(Transformer *t, char* checkpoint_path) {
-  // read in the Config and the Weights from the checkpoint
-  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
-  // allocate the RunState buffers
-
-#pragma omp parallel for
-  for (int i = 0; i < MAX_GPU; i++) {
-    CHECK_HIP(hipSetDevice(i));
-    initGPUWeights(&t->config, &t->weights_gpu[i], &t->data, &t->file_size);
-    printf("Malloced weights for GPU %d\n", i);
-    for (int j = 0; j < MAX_REQ; j++) {
-      malloc_run_state(&t->state[i][j], &t->config);
-      printf("Malloced run state for GPU %d, request %d\n", i, j);
-    }
-  }
-  
-  print_transformer(t);
-}
-
-void free_transformer(Transformer* t) {
-    // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
-// #ifdef USE_GPU
-//     // we hipMalloc a region of memory, then hand the address to
-//     // the token_embedding_table field.  Free it here.
-//     CHECK_HIP(hipFree(t->weights.token_embedding_table));
-// #elif KERNEL_TEST
-//     CHECK_HIP(hipHostFree(t->weights.token_embedding_table));
-// #endif
-    // free the RunState buffers
-    #pragma omp parallel for
-    for (int i=0; i<MAX_GPU; i++) {
-        CHECK_HIP(hipSetDevice(i));
-        CHECK_HIP(hipFree(t->weights_gpu[i].token_embedding_table));
-        for (int j=0; j<MAX_REQ; j++) {
-          free_run_state(&t->state[i][j]);
-        }
-    }
-}
-// ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
-
-__inline__ __device__
-float warpReduceSum(float val) {
-  for (int offset = warpSize/2; offset > 0; offset >>= 1) 
-    val += __shfl_down(val, offset);
-  return val;
-}
-
-__inline__ __device__
-float warpReduceMax(float val) {
-  for (int offset = warpSize/2; offset > 0; offset >>= 1) 
-    val = max(val, __shfl_down(val, offset));
-  return val;
-}
-
-#define WARP_SIZE 64
-__inline__ __device__
-float blockReduceSum(float val) {
-
-  static __shared__ float shared[WARP_SIZE]; // Shared mem for 16 partial sums
-  int lane = threadIdx.x % warpSize;
-  int wid = threadIdx.x / warpSize;
-
-  val = warpReduceSum(val);     // Each warp performs partial reduction
-
-  if (lane==0) shared[wid]=val; // Write reduced value to shared memory
-
-  __syncthreads();              // Wait for all partial reductions
-
-  //read from shared memory only if that warp existed
-  val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
-
-  if (wid==0) val = warpReduceSum(val); //Final reduce within first warp
-
-  return val;
-}
-
-__inline__ __device__
-float blockReduceMax(float val) {
-
-  static __shared__ float shared[WARP_SIZE]; // Shared mem for 16 partial max values
-  int lane = threadIdx.x % warpSize;
-  int wid = threadIdx.x / warpSize;
-
-  val = warpReduceMax(val);     // Each warp performs partial reduction
-
-  if (lane==0) shared[wid]=val; // Write reduced value to shared memory
-
-  __syncthreads();              // Wait for all partial reductions
-
-  //read from shared memory only if that warp existed
-  val = (threadIdx.x < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane] : 0.0f;
-
-  if (wid==0) val = warpReduceMax(val); //Final reduce within first warp
-
-  return val;
-}
-
-// Utility routine to divide a into ceiling of b parts
-int divUp(int a, int b) {
-    return (a - 1) / b + 1;
-}
-
-const int num_threads_lrg = 1024;
-const int num_threads_med = 256;
-
-__global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size) {
-    // parallel reduction of sum of squares via CUB
-    const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
-
-    float ss = 0.0f;
-    for (int i = tid; i < size; i+=num_threads) {
-        ss += x[i] * x[i];
-    }
-    ss = blockReduceSum(ss);
-
-    // serialization point to calculate normalization factor 
-    __shared__ float shared_ss;
-    if (threadIdx.x == 0) {
-        ss /= size;
-        ss += 1e-5f;
-        ss = 1.0f / sqrtf(ss);
-        shared_ss = ss;
-    }
-    __syncthreads();
-    ss = shared_ss;
-
-    // normalize and scale
-    for (int i = tid; i < size; i+=num_threads) {
-        o[i] = weight[i] * (ss * x[i]);
-    }
-}
-void gpu_rmsnorm(float* o, float* x, float* weight, int size, hipStream_t *stream) {
-    rmsnorm_kernel <<<1, num_threads_lrg, 0, *stream >>> (o, x, weight, size);
-}
-
-void rmsnorm(float* o, float* x, float* weight, int size) {
-  // calculate sum of squares
-  float ss = 0.0f;
-  for (int j = 0; j < size; j++) {
-    ss += x[j] * x[j];
-  }
-  ss /= size;
-  ss += 1e-5f;
-  ss = 1.0f / sqrtf(ss);
-  // normalize and scale
-  for (int j = 0; j < size; j++) {
-    o[j] = weight[j] * (ss * x[j]);
-  }
-}
-
-__device__ void softmax_gpu(float* __restrict__ x, int size) {
-    int tid = threadIdx.x;
-    int step = blockDim.x;
-
-    // find max value (for numerical stability)
-    float max_val = tid < size ? x[tid] : 0;
-    for (int i = tid + step; i < size; i += step) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
-    }
-    __shared__ float shared_val;
-    max_val = blockReduceMax(max_val);
-    if (threadIdx.x == 0) {
-        shared_val = max_val;
-    }
-    __syncthreads();
-    max_val = shared_val;
-
-    // exp and sum
-    float sum = 0.0f;
-    for (int i = tid; i < size; i += step) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    sum = blockReduceSum(sum);
-    if (threadIdx.x == 0) {
-        shared_val = sum;
-    }
-    __syncthreads();
-    sum = shared_val;
-
-    // normalize
-    for (int i = tid; i < size; i += step) {
-        x[i] /= sum;
-    }
-}
-
-void softmax(float* x, int size) {
-  // find max value (for numerical stability)
-  float max_val = x[0];
-  for (int i = 1; i < size; i++) {
-    if (x[i] > max_val) {
-      max_val = x[i];
-    }
-  }
-  // exp and sum
-  float sum = 0.0f;
-  for (int i = 0; i < size; i++) {
-    x[i] = expf(x[i] - max_val);
-    sum += x[i];
-  }
-  // normalize
-  for (int i = 0; i < size; i++) {
-    x[i] /= sum;
-  }
-}
-
-__global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
-
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int d_i = blockIdx.x;
-  float val = 0.0f;
-
-  for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
-    val += w[d_i * n + idx] * x[idx];
-  }
-  val = blockReduceSum(val);
-
-  if (threadIdx.x == 0) {
-    xout[d_i] = val;
-  }
-}
-
-void gpu_matmul(float* xout, float* x, float* w, int n, int d, hipStream_t *stream) {
-  matmul_kernel<<<d, 512, 0, *stream>>>(xout, x, w, n, d);
-  CHECK_HIP(hipGetLastError());
-}
-
-void matmul(float* xout, float* x, float* w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  int i;
-  #pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-        val += w[i * n + j] * x[j];
-    }
-    xout[i] = val;
-  }
-}
-
-__global__ void RoPE_kernel(int pos, float* sq, float* sk, 
-                            int dim, int kv_dim, int head_size) {
-  int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-  if (i >= dim) return;
-
-  int head_dim = i % head_size;
-  float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-  float val = pos * freq;
-  float fcr = cosf(val);
-  float fci = sinf(val);
-  int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-  for (int v = 0; v < rotn; v++) {
-    float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-    float v0 = vec[i];
-    float v1 = vec[i+1];
-    vec[i]   = v0 * fcr - v1 * fci;
-    vec[i+1] = v0 * fci + v1 * fcr;
-  }
-}
-void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, hipStream_t *stream) {
-  dim3 block(64);
-  dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  RoPE_kernel<<<grid, block, 0, *stream>>>(pos, sq, sk, dim, kv_dim, head_size);
-  CHECK_HIP(hipGetLastError());
-}
-
-void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) { //s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size) {
-    for (int i = 0; i < dim; i+=2) {
-        int head_dim = i % head_size;
-        float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-        float val = pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-        int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-        for (int v = 0; v < rotn; v++) {
-            float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
-            float v0 = vec[i];
-            float v1 = vec[i+1];
-            vec[i]   = v0 * fcr - v1 * fci;
-            vec[i+1] = v0 * fci + v1 * fcr;
-        }
-    }
-}
-
-#define MAX_SEQ_LEN 8192
-// __global__ void MultiHeadAttention_kernel(int pos, int seq_len, float *sq, float *satt, float *sxb, float *key_cache, float *value_cache, int kv_dim, int kv_mul, int head_size, int loff, int dim) {
-  // int h = blockIdx.x;
-  // // get the query vector for this head
-  // float* q = sq + h * head_size;
-  // // attention scores for this head
-  // float* att = satt + h * seq_len;
-  // // iterate over all timesteps, including the current one 
-  // // In hip, each thread does a small portion of the calc
-  // for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-  //   // get the key vector for this head and at this timestep
-  //   float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-  //   // calculate the attention score as the dot product of q and k
-  //   float score = 0.0f;
-  //   for (int i = 0; i < head_size; i++) {
-  //       score += q[i] * k[i];
-  //   }
-  //   score /= sqrtf(head_size);
-  //   // save the score to the attention buffer
-  //   att[t] = score;
-  // }
-  // // above was this threads portion of the iteration.  wait for all threads to finish
-  // __syncthreads();
-
-  // // softmax the scores to get attention weights, from 0..pos inclusively
-  // softmax_gpu(att, pos + 1);
-  // __syncthreads();
-
-  // // weighted sum of the values, store back into xb
-  // // NOTE: by swapping the order of the for loops (vs. C) a simpler
-  // // version of the code accomplishes the same task and fits more
-  // // naturally with the hip way of subdividing the problem.
-  // float* xb = sxb + h * head_size;
-  // for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-  //   float val = 0.0f;
-  //   for (int t = 0; t <= pos; t++) {
-  //       // get the value vector for this head and at this timestep
-  //       float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-  //       // get the attention weight for this timestep
-  //       float a = att[t];
-  //       val += a * v[i];
-  //   }
-  //   xb[i] = val;
-  // }
-__global__ void MultiHeadAttention_kernel(float* __restrict__ output, const float* __restrict__ sq,
-    const float* __restrict__ key_cache, const float* __restrict__ value_cache,
-    int num_heads, int head_size, int loff, int seq_len, int dim) {
-
-    int h = blockIdx.x;
-
-    // get the query vector for this head
-    const float* q = sq + h * head_size;
-    // attention scores for this head
-    __shared__ float att[MAX_SEQ_LEN];
-
-    // iterate over all timesteps, including the current one
-    for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
-        // get the key vector for this head and at this timestep
-        const float* k = key_cache + loff + t * dim + h * head_size;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++)
-            score += q[i] * k[i];
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
-        att[t] = score;
-    }
-    __syncthreads();
-
-    // softmax the scores to get attention weights
-    softmax_gpu(att, seq_len);
-    __syncthreads();
-
-    // weighted sum of the values, store back into xb
-    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-        float val = 0.0f;
-        for (int t = 0; t < seq_len; t++)
-            val += att[t] * value_cache[loff + t * dim + h * head_size + i];
-        output[h * head_size + i] = val;
-    }
-}
-// void gpu_MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
-    // MultiHeadAttention_kernel <<<p->n_heads, num_threads_lrg>>> (pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache, kv_dim, kv_mul, head_size, loff, head_size * p->n_heads);
-// }
-
-void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, int num_heads, int head_size, int loff, int seq_len, hipStream_t *stream) {
-    int dim = head_size * num_heads;
-    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg, 0, *stream>>> (output, q, key_cache, value_cache, num_heads, head_size, loff, seq_len, dim);
-}
-
-void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
-  int h;
-  #pragma omp parallel for private(h)
-  for (h = 0; h < p->n_heads; h++) {
-    // get the query vector for this head
-    float* q = s->q + h * head_size;
-    // attention scores for this head
-    float* att = s->att + h * p->seq_len;
-    // iterate over all timesteps, including the current one
-    for (int t = 0; t <= pos; t++) {
-      // get the key vector for this head and at this timestep
-      float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-      // calculate the attention score as the dot product of q and k
-      float score = 0.0f;
-      for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-      }
-      score /= sqrtf(head_size);
-      // save the score to the attention buffer
-      att[t] = score;
-    }
-
-    // softmax the scores to get attention weights, from 0..pos inclusively
-    softmax(att, pos + 1);
-
-    // weighted sum of the values, store back into xb
-    float* xb = s->xb + h * head_size;
-    memset(xb, 0, head_size * sizeof(float));
-    for (int t = 0; t <= pos; t++) {
-      // get the value vector for this head and at this timestep
-      float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-      // get the attention weight for this timestep
-      float a = att[t];
-      // accumulate the weighted value into xb
-      for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-      }
-    }
-  }
-}
-
-__global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden_dim) {
-        float val = shb[i];
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-        val *= (1.0f / (1.0f + expf(-val)));
-        // elementwise multiply with w3(x)
-        val *= shb2[i];
-        shb[i] = val;
-    }
-}
-void gpu_swiglu(float *shb, float *shb2, int hidden_dim, hipStream_t *stream) {
-    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, *stream>>>(shb, shb2, hidden_dim);
-}
-
-void swiglu(float *shb, float *shb2, int hidden_dim) {
-    for (int i = 0; i < hidden_dim; i++) {
-        float val = shb[i];
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-        val *= (1.0f / (1.0f + expf(-val)));
-        // elementwise multiply with w3(x)
-        val *= shb2[i];
-        shb[i] = val;
-    }
-}
-
-__global__ void accum_kernel(float* a, float* b, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < size) {
-      a[i] += b[i];
-  }
-}
-void gpu_accum(float *a, float *b, int size, hipStream_t *stream) {
-  accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, *stream>>>(a,b,size);
-}
-
-void accum(float *a, float *b, int size) {
-  for (int i = 0; i < size; i++) {
-    a[i] += b[i];
-  }
-}
-
-// ----------------------------------------------------------
+// Forward inference
 
 float* forward(Transformer* transformer, int token, int pos, int device_id, int thread_id, hipStream_t *stream) {
 
@@ -742,7 +53,8 @@ float* forward(Transformer* transformer, int token, int pos, int device_id, int 
   // copy the token embedding into x
   float* content_row = w->token_embedding_table + token * dim;
 #ifdef USE_GPU
-  CHECK_HIP(hipMemcpyAsync(x, content_row, dim*sizeof(*x), hipMemcpyHostToDevice, *stream));
+  // x = content_row;
+  CHECK_HIP(hipMemcpyAsync(x, content_row, dim*sizeof(*x), hipMemcpyDeviceToDevice, *stream));
   CHECK_HIP(hipStreamSynchronize(*stream));
 #else
   memcpy(x, content_row, dim*sizeof(*x));
@@ -797,6 +109,7 @@ float* forward(Transformer* transformer, int token, int pos, int device_id, int 
 
     // residual connection
     gpu_accum(x, s->xb, dim, stream);
+    
 #else
     rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
@@ -852,479 +165,13 @@ float* forward(Transformer* transformer, int token, int pos, int device_id, int 
   return s->logits;
 }
 
-// ----------------------------------------------------------------------------
-// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
-
-
-
-int compare_tokens(const void *a, const void *b) {
-  return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
-}
-
-void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
-  // i should have written the vocab_size into the tokenizer file... sigh
-  t->vocab_size = vocab_size;
-  // malloc space to hold the scores and the strings
-  t->vocab = (char**)malloc(vocab_size * sizeof(char*));
-  t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
-  t->sorted_vocab = NULL; // initialized lazily
-  for (int i = 0; i < 256; i++) {
-    t->byte_pieces[i * 2] = (unsigned char)i;
-    t->byte_pieces[i * 2 + 1] = '\0';
-  }
-  // read in the file
-  FILE *file = fopen(tokenizer_path, "rb");
-  if (!file) { fprintf(stderr, "couldn't load %s\n", tokenizer_path); exit(EXIT_FAILURE); }
-  if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
-  int len;
-  for (int i = 0; i < vocab_size; i++) {
-    if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE);}
-    if (fread(&len, sizeof(int), 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
-    t->vocab[i] = (char *)malloc(len + 1);
-    if (fread(t->vocab[i], len, 1, file) != 1) { fprintf(stderr, "failed read\n"); exit(EXIT_FAILURE); }
-    t->vocab[i][len] = '\0'; // add the string terminating token
-  }
-  fclose(file);
-  // lazily malloc and sort the vocabulary
-  t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
-  for (int i = 0; i < t->vocab_size; i++) {
-    t->sorted_vocab[i].str = t->vocab[i];
-    t->sorted_vocab[i].id = i;
-  }
-  qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
-}
-
-void free_tokenizer(Tokenizer* t) {
-  for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
-  free(t->vocab);
-  free(t->vocab_scores);
-  free(t->sorted_vocab);
-}
-
-char* decode(Tokenizer* t, int prev_token, int token) {
-  char *piece = t->vocab[token];
-  // following BOS (1) token, sentencepiece decoder strips any leading whitespace (see PR #89)
-  if (prev_token == 1 && piece[0] == ' ') { piece++; }
-  // careful, some tokens designate raw bytes, and look like e.g. '<0x01>'
-  // parse this and convert and return the actual byte
-  unsigned char byte_val;
-  if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
-    piece = (char*)t->byte_pieces + byte_val * 2;
-  }
-  return piece;
-}
-
-void safe_printf(char *piece) {
-  // piece might be a raw byte token, and we only want to print printable chars or whitespace
-  // because some of the other bytes can be various control codes, backspace, etc.
-  if (piece == NULL) { return; }
-  if (piece[0] == '\0') { return; }
-  if (piece[1] == '\0') {
-    unsigned char byte_val = piece[0];
-    if (!(isprint(byte_val) || isspace(byte_val))) {
-      return; // bad byte, don't print it
-    }
-  }
-  printf("%s", piece);
-}
-
-void append_str(char *piece, std::string& str) {
-  // piece might be a raw byte token, and we only want to print printable chars or whitespace
-  // because some of the other bytes can be various control codes, backspace, etc.
-  if (piece == NULL) { return; }
-  if (piece[0] == '\0') { return; }
-  if (piece[1] == '\0') {
-    unsigned char byte_val = piece[0];
-    if (!(isprint(byte_val) || isspace(byte_val))) {
-      return; // bad byte, don't print it
-    }
-  }
-  //printf("%s", piece);
-  str += piece;
-}
-
-int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
-  // efficiently find the perfect match for str in vocab, return its index or -1 if not found
-  TokenIndex tok = { .str = str }; // acts as the key to search for
-  TokenIndex *res = (TokenIndex *)bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
-  return res != NULL ? res->id : -1;
-}
-
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
-  // encode the string text (input) into an upper-bound preallocated tokens[] array
-  // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
-  if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
-
-
-
-  // create a temporary buffer that will store merge candidates of always two consecutive tokens
-  // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-  char* str_buffer = (char*)malloc((t->max_token_length*2 +1 +2) * sizeof(char));
-  size_t str_len = 0;
-
-  // start at 0 tokens
-  *n_tokens = 0;
-
-  // add optional BOS (=1) token, if desired
-  if (bos) tokens[(*n_tokens)++] = 1;
-
-  // add_dummy_prefix is true by default
-  // so prepend a dummy prefix token to the input string, but only if text != ""
-  // TODO: pretty sure this isn't correct in the general case but I don't have the
-  // energy to read more of the sentencepiece code to figure out what it's doing
-  if (text[0] != '\0') {
-    int dummy_prefix = str_lookup((char *)" ", t->sorted_vocab, t->vocab_size);
-    tokens[(*n_tokens)++] = dummy_prefix;
-  }
-
-  // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
-  // Code point ↔ UTF-8 conversion
-  // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
-  // U+0000	U+007F	    0xxxxxxx
-  // U+0080	U+07FF	    110xxxxx	10xxxxxx
-  // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
-  // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
-
-  // process the raw (UTF-8) byte sequence of the input string
-  for (char *c = text; *c != '\0'; c++) {
-
-    // reset buffer if the current byte is ASCII or a leading byte
-    // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
-    // 0x80 is 10000000
-    // in UTF-8, all continuation bytes start with "10" in first two bits
-    // so in English this is: "if this byte is not a continuation byte"
-    if ((*c & 0xC0) != 0x80) {
-      // this byte must be either a leading byte (11...) or an ASCII char (0x...)
-      // => reset our location, as we're starting a new UTF-8 codepoint
-      str_len = 0;
-    }
-
-    // append the current byte to the buffer
-    str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
-    str_buffer[str_len] = '\0';
-
-    // while the next character is a continuation byte, continue appending
-    // but if there are too many of them, just stop to avoid overruning str_buffer size.
-    if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
-      continue;
-    }
-
-    // ok c+1 is not a continuation byte, so we've read in a full codepoint
-    int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-
-    if (id != -1) {
-      // we found this codepoint in vocab, add it as a token
-      tokens[(*n_tokens)++] = id;
-    } else {
-      // byte_fallback encoding: just encode each byte as a token
-      // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
-      // so the individual bytes only start at index 3
-      for (int i=0; i < str_len; i++) {
-        tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
-      }
-    }
-    str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
-  }
-
-  // merge the best consecutive pair each iteration, according the scores in vocab_scores
-  while (1) {
-    float best_score = -1e10;
-    int best_id = -1;
-    int best_idx = -1;
-
-    for (int i=0; i < (*n_tokens-1); i++) {
-      // check if we can merge the pair (tokens[i], tokens[i+1])
-      sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
-      int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-      if (id != -1 && t->vocab_scores[id] > best_score) {
-        // this merge pair exists in vocab! record its score and position
-        best_score = t->vocab_scores[id];
-        best_id = id;
-        best_idx = i;
-      }
-    }
-
-    if (best_idx == -1) {
-      break; // we couldn't find any more pairs to merge, so we're done
-    }
-
-    // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-    tokens[best_idx] = best_id;
-    // delete token at position best_idx+1, shift the entire sequence back 1
-    for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-      tokens[i] = tokens[i+1];
-    }
-    (*n_tokens)--; // token length decreased
-  }
-
-  // add optional EOS (=2) token, if desired
-  if (eos) tokens[(*n_tokens)++] = 2;
-
-  free(str_buffer);
-}
-
-// ----------------------------------------------------------------------------
-// The Sampler, which takes logits and returns a sampled token
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
-
-
-
-int sample_argmax(float* probabilities, int n) {
-  // return the index that has the highest probability
-  int max_i = 0;
-  float max_p = probabilities[0];
-  for (int i = 1; i < n; i++) {
-    if (probabilities[i] > max_p) {
-      max_i = i;
-      max_p = probabilities[i];
-    }
-  }
-  return max_i;
-}
-
-int sample_mult(float* probabilities, int n, float coin) {
-  // sample index from probabilities (they must sum to 1!)
-  // coin is a random number in [0, 1), usually from random_f32()
-  float cdf = 0.0f;
-  for (int i = 0; i < n; i++) {
-    cdf += probabilities[i];
-    if (coin < cdf) {
-      return i;
-    }
-  }
-  return n - 1; // in case of rounding errors
-}
-
-int compare(const void* a, const void* b) {
-  ProbIndex* a_ = (ProbIndex*) a;
-  ProbIndex* b_ = (ProbIndex*) b;
-  if (a_->prob > b_->prob) return -1;
-  if (a_->prob < b_->prob) return 1;
-  return 0;
-}
-
-int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
-  // top-p sampling (or "nucleus sampling") samples from the smallest set of
-  // tokens that exceed probability topp. This way we never sample tokens that
-  // have very low probabilities and are less likely to go "off the rails".
-  // coin is a random number in [0, 1), usually from random_f32()
-
-  int n0 = 0;
-  // quicksort indices in descending order of probabilities
-  // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-  // so for efficiency we crop these out as candidates before sorting
-  const float cutoff = (1.0f - topp) / (n - 1);
-  for (int i = 0; i < n; i++) {
-    if (probabilities[i] >= cutoff) {
-      probindex[n0].index = i;
-      probindex[n0].prob = probabilities[i];
-      n0++;
-    }
-  }
-  qsort(probindex, n0, sizeof(ProbIndex), compare);
-
-  // truncate the list where cumulative probability exceeds topp
-  float cumulative_prob = 0.0f;
-  int last_idx = n0 - 1; // in case of rounding errors consider all elements
-  for (int i = 0; i < n0; i++) {
-    cumulative_prob += probindex[i].prob;
-    if (cumulative_prob > topp) {
-      last_idx = i;
-      break; // we've exceeded topp by including last_idx
-    }
-  }
-
-  // sample from the truncated list
-  float r = coin * cumulative_prob;
-  float cdf = 0.0f;
-  for (int i = 0; i <= last_idx; i++) {
-    cdf += probindex[i].prob;
-    if (r < cdf) {
-      return probindex[i].index;
-    }
-  }
-  return probindex[last_idx].index; // in case of rounding errors
-}
-
-void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
-  sampler->vocab_size = vocab_size;
-  sampler->temperature = temperature;
-  sampler->topp = topp;
-  sampler->rng_state = rng_seed;
-  // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = (ProbIndex *)malloc(sampler->vocab_size * sizeof(ProbIndex));
-}
-
-void free_sampler(Sampler* sampler) {
-  free(sampler->probindex);
-}
-
-unsigned int random_u32(unsigned long long *state) {
-  // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-  *state ^= *state >> 12;
-  *state ^= *state << 25;
-  *state ^= *state >> 27;
-  return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(unsigned long long *state) { // random float32 in [0,1)
-  return (random_u32(state) >> 8) / 16777216.0f;
-}
-
-int sample(Sampler* sampler, float* logits) {
-  // sample the token given the logits and some hyperparameters
-  int next;
-  if (sampler->temperature == 0.0f) {
-    // greedy argmax sampling: take the token with the highest probability
-    next = sample_argmax(logits, sampler->vocab_size);
-  } else {
-    // apply the temperature to the logits
-    for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
-    // apply softmax to the logits to get the probabilities for next token
-    softmax(logits, sampler->vocab_size);
-    // flip a (float) coin (this is our source of entropy for sampling)
-    float coin = random_f32(&sampler->rng_state);
-    // we sample from this distribution to get the next token
-    if (sampler->topp <= 0 || sampler->topp >= 1) {
-      // simply sample from the predicted probability distribution
-      next = sample_mult(logits, sampler->vocab_size, coin);
-    } else {
-      // top-p (nucleus) sampling, clamping the least likely tokens to zero
-      next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
-    }
-  }
-  return next;
-}
-
-int sample_greedy(Sampler* sampler, float* logits) {
-  // sample the token given the logits and some hyperparameters
-  int next;
-  // greedy argmax sampling: take the token with the highest probability
-  next = sample_argmax(logits, sampler->vocab_size);
-  return next;
-}
-
-int sample_determin(const Sampler* sampler, float* logits, unsigned long long* rng_states, int idx) {
-  // sample the token given the logits and some hyperparameters
-  int next;
-  float temperature = 1.0f;
-  // apply the temperature to the logits
-  for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= temperature; }
-  // apply softmax to the logits to get the probabilities for next token
-  softmax(logits, sampler->vocab_size);
-  // flip a (float) coin (this is our source of entropy for sampling)
-  float coin = random_f32(&rng_states[idx]);
-
-  next = sample_mult(logits, sampler->vocab_size, coin);
-  return next;
-}
-
-
-void build_requests(Requests* reqs, int num_reqs, int max_token_len, int max_seq_len) {
-  reqs->num_reqs = num_reqs;
-  reqs->max_token_len = max_token_len;
-  reqs->max_seq_len = max_seq_len;
-  reqs->str_reqs = (char*)calloc(num_reqs * max_token_len * max_seq_len + 1, sizeof(char));
-  reqs->str_gens = (char*)calloc(num_reqs * max_token_len * max_seq_len + 1, sizeof(char));
-  printf("requests size = %lu B\n", ((num_reqs * max_token_len * max_seq_len * sizeof(char) +1) * 2));
-}
-
-void free_requests(Requests* reqs) {
-  free(reqs->str_reqs);
-  free(reqs->str_gens);
-}
-
-char* get_str_req_ptr(Requests* reqs, int idx) {
-  return reqs->str_reqs + idx * reqs->max_token_len * reqs->max_seq_len;
-}
-
-char* get_str_gen_ptr(Requests* reqs, int idx) {
-  return reqs->str_gens + idx * reqs->max_token_len * reqs->max_seq_len;
-}
-
-
-int read_inputfile(const char* input_filename, int max_token_len, int max_seq_len, Requests* reqs) {
-  std::string filename = input_filename;
-  int num_reqs= 0;
-
-  printf("max_token_len: %d, max_seq_len: %d\n", max_token_len, max_seq_len);
-
-  std::ifstream openFile(filename.c_str());
-  if (openFile.is_open() ) {
-    std::string line;
-
-    // Read the number of Requests
-    std::getline(openFile, line);
-    num_reqs = atoi(line.c_str());
-
-    build_requests(reqs, num_reqs, max_token_len, max_seq_len);
-
-    int idx = 0;
-    while(std::getline(openFile, line)) {
-      memcpy(get_str_req_ptr(reqs, idx), line.c_str(), line.size());
-      idx++;
-      if(idx >= num_reqs) break;
-    }
-    openFile.close();
-  }
-  else {
-    fprintf(stderr, "cannot open the file: %s\n", input_filename);
-    exit(EXIT_FAILURE);
-  }
-
-  return 0;
-}
-
-int write_outputfile(const char* output_filename, Requests* reqs) {
-  std::string filename = output_filename;
-
-  // write File
-  std::ofstream writeFile(filename.c_str());
-  if( writeFile.is_open() ){
-    writeFile << reqs->num_reqs << "\n";
-    for(int i = 0; i < reqs->num_reqs; i++) {
-      writeFile << get_str_gen_ptr(reqs, i) << "\n";
-    }
-    writeFile.close();
-  }
-  else {
-    fprintf(stderr, "cannot write the file: %s\n", output_filename);
-    exit(EXIT_FAILURE);
-  }
-
-  return 0;
-}
-
-
-
-// ----------------------------------------------------------------------------
-// utilities: time
-
-long time_in_ms() {
-  // return time in milliseconds, for benchmarking the model speed
-  struct timespec time;
-  clock_gettime(CLOCK_REALTIME, &time);
-  return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
-
-void read_stdin(const char* guide, char* buffer, size_t bufsize) {
-  // read a line from stdin, up to but not including \n
-  printf("%s", guide);
-  if (fgets(buffer, bufsize, stdin) != NULL) {
-    size_t len = strlen(buffer);
-    if (len > 0 && buffer[len - 1] == '\n') {
-      buffer[len - 1] = '\0'; // strip newline
-    }
-  }
-}
-
 static hipStream_t streams[MAX_GPU][MAX_REQ];
 static size_t rStart[MAX_GPU][MAX_REQ], rEnd[MAX_GPU][MAX_REQ];
 static size_t num_reqs[MAX_GPU];
 
 
-void initStreams(int num_gpu, int num_reqs) {
-  for(int i = 0; i < num_gpu; i++) {
+void initStreams() {
+  for(int i = 0; i < NUM_GPU; i++) {
     CHECK_HIP(hipSetDevice(i));
     for(int j = 0; j < MAX_REQ; j++) {
       CHECK_HIP(hipStreamCreate(&streams[i][j]));
@@ -1332,8 +179,8 @@ void initStreams(int num_gpu, int num_reqs) {
   }
 }
 
-void destroyStreams(int num_gpu, int num_reqs) {
-  for(int i = 0; i < num_gpu; i++) {
+void destroyStreams() {
+  for(int i = 0; i < NUM_GPU; i++) {
     CHECK_HIP(hipSetDevice(i));
     for(int j = 0; j < MAX_REQ; j++) {
       CHECK_HIP(hipStreamDestroy(streams[i][j]));
@@ -1469,12 +316,9 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
   pthread_attr_t attr[MAX_GPU][MAX_REQ];
   cpu_set_t cpus[MAX_GPU][MAX_REQ];
 
-  int numDevices;
-  CHECK_HIP(hipGetDeviceCount(&numDevices));
-  printf("Number of Devices: %d\n", numDevices);
   printf("num_reqs: %d\n", num_reqs);
 
-  for (int i=0; i<numDevices; i++) {
+  for (int i=0; i<NUM_GPU; i++) {
     // CHECK_HIP(hipSetDevice(i));
     for (int j=0; j<MAX_REQ; j++) {
 
@@ -1485,8 +329,6 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
       args[i][j].device_id = i;
       args[i][j].total_reqs = num_reqs;
       args[i][j].next_req = next_req;
-
-      printf("args next_req: %d\n", *args[i][j].next_req);
 
       pthread_attr_init(&attr[i][j]);
       CPU_ZERO(&cpus[i][j]);
@@ -1502,13 +344,13 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
     }
   }
 
-  for (int i=0; i<numDevices; i++) {
+  for (int i=0; i<NUM_GPU; i++) {
     for (int j=0; j<MAX_REQ; j++) {
       pthread_join(threads[i][j], NULL);
     }
   }
 
-  for (int i=0; i<numDevices; i++) {
+  for (int i=0; i<NUM_GPU; i++) {
     for (int j=0; j<MAX_REQ; j++) {
       gen_cnt += cnt_threads[i][j];
     }
@@ -1590,8 +432,10 @@ int main(int argc, char *argv[]) {
   if (steps < 0) steps = 0;
 
   // build the Transformer via the model .bin file
+  CHECK_HIP(hipGetDeviceCount(&NUM_GPU));
+  printf("Number of Devices: %d\n", NUM_GPU);
 
-  initStreams(MAX_GPU, MAX_REQ);
+  initStreams();
   Transformer transformer;
   build_transformer(&transformer, checkpoint_path);
   if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
@@ -1599,10 +443,6 @@ int main(int argc, char *argv[]) {
   // build the Tokenizer via the tokenizer .bin file
   Tokenizer tokenizer;
   build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-
-  // build the Sampler
-  Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
   Requests requests;
 
@@ -1614,7 +454,6 @@ int main(int argc, char *argv[]) {
     //chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
   } 
   else if  (strcmp(mode, "test") == 0) {
-    int num_reqs;
     steps = transformer.config.seq_len;
     if(input_filename == NULL || output_filename == NULL) {
       error_usage();
@@ -1628,9 +467,7 @@ int main(int argc, char *argv[]) {
     // {
     long start, end;
     start = time_in_ms();
-    // int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch);
     int num_gen_tokens = test(&transformer, &tokenizer, &requests, batch);
-  //   // printf("Prepare to run\n");
     end = time_in_ms();
 
     // Your goal is to achieve best throughput(=reduce elapsed time)! 
@@ -1649,7 +486,7 @@ int main(int argc, char *argv[]) {
     error_usage();
   }
 
-  destroyStreams(MAX_GPU, MAX_REQ);
+  destroyStreams();
   // // memory and file handles cleanup
   // free_sampler(&sampler);
   // free_tokenizer(&tokenizer);
