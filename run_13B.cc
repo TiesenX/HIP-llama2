@@ -16,9 +16,8 @@
 #include <hip/hip_runtime.h>
 #include <omp.h>
 #include <pthread.h>
-#include <math.h>
-#include "build.h"
-#include "kernels.h"
+#include "build_pipeline.h"
+#include "kernels_pipeline.h"
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -36,132 +35,128 @@
 // ----------------------------------------------------------------------------
 // Forward inference
 
-float* forward(Transformer* transformer, int token, int pos, int device_id, int thread_id, hipStream_t *stream) {
+float* forward(Transformer* transformer, int token, int pos) {
 
   // a few convenience variables
   Config* p = &transformer->config;
-  TransformerWeights* w = &transformer->weights_gpu[device_id];
-  RunState* s = &transformer->state[device_id][thread_id];
-  float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
   int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int hidden_dim =  p->hidden_dim;
   int head_size = dim / p->n_heads;
 
+  TransformerWeights* w[NUM_GPU];
+  RunState* s[NUM_GPU];
+  for (int device_id = 0; device_id < NUM_GPU; device_id++) {
+    CHECK_HIP(hipSetDevice(device_id));
+    w[device_id] = &transformer->weights_gpu[device_id];
+    s[device_id] = &transformer->state[device_id];
+  }
+
+  CHECK_HIP(hipSetDevice(0));
+  float *x[NUM_GPU];
+  x[0] = s[0]->x;
+
   // copy the token embedding into x
-  float* content_row = w->token_embedding_table + token * dim;
+  float* content_row = w[0]->token_embedding_table + token * dim;
 
-  CHECK_HIP(hipMemcpyAsync(x, content_row, dim*sizeof(*x), hipMemcpyDeviceToDevice, *stream));
-  CHECK_HIP(hipStreamSynchronize(*stream));
+  CHECK_HIP(hipMemcpyAsync(x[0], content_row, dim*sizeof(*x[0]), hipMemcpyDeviceToDevice, streams[0]));
+  CHECK_HIP(hipStreamSynchronize(streams[0]));
 
+  for (int device_id = 0; device_id < NUM_GPU; device_id++) {
+    CHECK_HIP(hipSetDevice(device_id));
+    if (device_id > 0) {
+      CHECK_HIP(hipStreamWaitEvent(streams[device_id], events[device_id - 1], 0));
+    }
 
-  // forward all the layers
-  for(unsigned long long l = 0; l < p->n_layers; l++) {
-    // printf("Layer: %llu\n", l);
-    // attention rmsnorm
-    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, stream);
+    x[device_id] = s[device_id]->x;
 
-    // save key,value at this time step (pos) to our kv cache
-    int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
-    s->k = s->key_cache + loff + pos * kv_dim;
-    s->v = s->value_cache + loff + pos * kv_dim;
+    // forward all the layers
+    int num_layers = layer_end[device_id] - layer_begin[device_id];
+    for(int l = 0; l < num_layers; l++) {
+      
+      // attention rmsnorm
+      gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_att_weight + l*dim, dim, streams[device_id]);
 
-    // qkv matmuls for this position
-    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, stream);
-    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, stream);
-    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, stream);
+      // save key,value at this time step (pos) to our kv cache
+      int loff = (layer_begin[device_id] + l) * p->seq_len * kv_dim;
+      s[device_id]->k = s[device_id]->key_cache + loff + pos * kv_dim;
+      s[device_id]->v = s[device_id]->value_cache + loff + pos * kv_dim;
 
-    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, stream);
+      // qkv matmuls for this position
+      gpu_matmul(s[device_id]->q, s[device_id]->xb, w[device_id]->wq + l*dim*dim, dim, dim, streams[device_id]);
+      gpu_matmul(s[device_id]->k, s[device_id]->xb, w[device_id]->wk + l*dim*kv_dim, dim, kv_dim, streams[device_id]);
+      gpu_matmul(s[device_id]->v, s[device_id]->xb, w[device_id]->wv + l*dim*kv_dim, dim, kv_dim, streams[device_id]);
 
+      gpu_RoPE(s[device_id]->q, s[device_id]->k, pos, dim, head_size, kv_dim, streams[device_id]);
+      
+      gpu_MultiHeadAttention(s[device_id]->xb, s[device_id]->q, 
+                             s[device_id]->key_cache, s[device_id]->value_cache, 
+                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, streams[device_id]);
 
-    gpu_MultiHeadAttention(s->xb, s->q, s->key_cache, s->value_cache, kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, stream);
+      // final matmul to get the output of the attention
+      gpu_matmul(s[device_id]->xb2, s[device_id]->xb, w[device_id]->wo + l*dim*dim, dim, dim, streams[device_id]);
 
-    // final matmul to get the output of the attention
-    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, stream);
+      // residual connection back into x
+      gpu_accum(x[device_id], s[device_id]->xb2, dim, streams[device_id]);
 
-    // residual connection back into x
-    gpu_accum(x, s->xb2, dim, stream);
+      // ffn rmsnorm
+      gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_ffn_weight + l*dim, dim, streams[device_id]);
 
-    // ffn rmsnorm
-    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, stream);
+      // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+      // first calculate self.w1(x) and self.w3(x)
+      gpu_matmul(s[device_id]->hb, s[device_id]->xb, w[device_id]->w1 + l*dim*hidden_dim, dim, hidden_dim, streams[device_id]);
+      gpu_matmul(s[device_id]->hb2, s[device_id]->xb, w[device_id]->w3 + l*dim*hidden_dim, dim, hidden_dim, streams[device_id]);
 
-    // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-    // first calculate self.w1(x) and self.w3(x)
-    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, stream);
-    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, stream);
+      // SwiGLU non-linearity
+      gpu_swiglu(s[device_id]->hb, s[device_id]->hb2, hidden_dim, streams[device_id]);
 
-    // SwiGLU non-linearity
-    gpu_swiglu(s->hb, s->hb2, hidden_dim, stream);
+      // final matmul to get the output of the ffn
+      gpu_matmul(s[device_id]->xb, s[device_id]->hb, w[device_id]->w2 + l*dim*hidden_dim, hidden_dim, dim, streams[device_id]);
 
-    // final matmul to get the output of the ffn
-    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, stream);
+      // residual connection
+      gpu_accum(x[device_id], s[device_id]->xb, dim, streams[device_id]);
+    }
 
-    // residual connection
-    gpu_accum(x, s->xb, dim, stream);
-  }
+    if (device_id < NUM_GPU - 1) {
+      CHECK_HIP(hipMemcpyAsync(s[device_id + 1]->x, s[device_id]->x, 
+                              dim * sizeof(float), hipMemcpyDeviceToDevice, streams[device_id]));
+      CHECK_HIP(hipEventRecord(events[device_id], streams[device_id]));
+    }
+    else {
+      // final rmsnorm
+      gpu_rmsnorm(x[device_id], x[device_id], w[device_id]->rms_final_weight, dim, streams[device_id]);
 
-  // final rmsnorm
-  gpu_rmsnorm(x, x, w->rms_final_weight, dim, stream);
-  // classifier into logits
-  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size, stream);
-  CHECK_HIP(hipMemcpyAsync(s->logits, s->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost, *stream));
-
-  return s->logits;
-}
-
-static hipStream_t streams[MAX_GPU][MAX_REQ];
-
-void initStreams() {
-  for(int i = 0; i < NUM_GPU; i++) {
-    CHECK_HIP(hipSetDevice(i));
-    for(int j = 0; j < MAX_REQ; j++) {
-      CHECK_HIP(hipStreamCreate(&streams[i][j]));
+      // classifier into logits
+      gpu_matmul(s[device_id]->logits_gpu, x[device_id], w[device_id]->wcls, p->dim, p->vocab_size, streams[device_id]);
+      
+      CHECK_HIP(hipMemcpyAsync(s[device_id]->logits, s[device_id]->logits_gpu, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost, streams[device_id]));
+      CHECK_HIP(hipStreamSynchronize(streams[device_id]));
+      return s[device_id]->logits;
     }
   }
-}
-
-void destroyStreams() {
-  for(int i = 0; i < NUM_GPU; i++) {
-    CHECK_HIP(hipSetDevice(i));
-    for(int j = 0; j < MAX_REQ; j++) {
-      CHECK_HIP(hipStreamDestroy(streams[i][j]));
-    }
-  }
+  return NULL;
 }
 
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-int cnt_threads[MAX_GPU][MAX_REQ];
+// ----------------------------------------------------------------------------
+// You should parallelize and optimize from this function exploiting multiple GPUs
+//
 
-void* test_worker(void* args) {
-  // printf("adhashdjashdkjahsd");
-  thread_args* targs = (thread_args*)args;
-  Transformer* transformer = targs->transformer;
-  Tokenizer* tokenizer = targs->tokenizer;
-  Requests* requests = targs->requests;
-  int device_id = targs->device_id;
-  int thread_id = targs->thread_id;
-  int *next_req = targs->next_req;
-
-  int current_req;
+int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1) {
+  // Count the number of the generated tokens
   int gen_cnt = 0;
-  
-  while(true) {
-    pthread_mutex_lock(&mutex);
-    current_req = *next_req;
-    *next_req = *next_req + 1;
-    pthread_mutex_unlock(&mutex);
-    if (current_req >= targs->total_reqs) {
-      break;
-    }
-    // Avoid randomness to generate tokens for batch input
-    // Each input request has its Sampler each
-    Sampler sampler;
-    build_sampler(&sampler, transformer->config.vocab_size, 1.0f, 0.9f, 314028);
+
+  Sampler samplers[requests->num_reqs];
+  for(int idx = 0; idx < requests->num_reqs; idx++) {
+    build_sampler(&samplers[idx], transformer->config.vocab_size, 1.0f, 0.9f, 314028);
+  }
+
+  for(int idx = 0; idx < 1; idx++) {
+  // for(int idx = 0; idx < requests->num_reqs; idx++) {
     // Loop for the multiple requests
     std::string gen_str = "";
-    char* prompt = get_str_req_ptr(requests, current_req);
+    char* prompt = get_str_req_ptr(requests, idx);
     int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
 
     // encode the (string) prompt into tokens sequence
@@ -177,21 +172,23 @@ void* test_worker(void* args) {
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
-    
     int steps = requests->max_seq_len; // max sequence length
     while (pos < steps) {
-      // forward the transformer to get logits for the next token
-      // printf("\npos: %d, token: %d\n", pos, token);
-      float* logits = forward(transformer, token, pos, device_id, thread_id, &streams[device_id][thread_id]);
-      CHECK_HIP(hipStreamSynchronize(streams[device_id][thread_id]));
-      // printf("Pass forward\n");
+
+      // -------------------------------------------------------------
+      // Divide device and run in GPUs here
+      float* logits = forward(transformer, token, pos);
+      // float* logits = 0;
+      // End of GPUs run
+      // -------------------------------------------------------------
+
       // advance the state machine
       if (pos < num_prompt_tokens - 1) {
         // if we are still processing the input prompt, force the next prompt token
         next = prompt_tokens[pos + 1];
       } else {
         // otherwise sample the next token from the logits
-        next = sample(&sampler, logits);
+        next = sample(&samplers[idx], logits);
         //next = sample_greedy(sampler, logits);
         //next = sample_determin(sampler, logits, rng_states, idx);
       }
@@ -204,23 +201,28 @@ void* test_worker(void* args) {
 
       // print the token as string, decode it with the Tokenizer object
       char* piece = decode(tokenizer, token, next);
+
       // You don't need to print every tokens are generated.
       // {
-      // safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+      safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
       fflush(stdout);
       // }
+
       // gen_str += piece;
+
       append_str(piece, gen_str);
+
       token = next;
+
       // init the timer here because the first iteration can be slower
       // this timer is not important
       if (start == 0) { start = time_in_ms(); }
 
     }
-    // printf("\n");
+    printf("\n");
 
     gen_str += "\n";
-    strcpy(get_str_gen_ptr(requests, current_req), gen_str.c_str());
+    strcpy(get_str_gen_ptr(requests, idx), gen_str.c_str());
     free(prompt_tokens);
 
     // report achieved tok/s (pos-1 because the timer starts after first iteration)
@@ -229,75 +231,12 @@ void* test_worker(void* args) {
       fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
       gen_cnt += pos-1;
     }
-    printf("End of the request\n");
-
-    // for(int idx = start_idx; idx < end_idx; idx++) {
-    free_sampler(&sampler);
-    // }
-    // return gen_cnt;
-  }
-  
-  cnt_threads[device_id][thread_id] = gen_cnt;
-  return NULL; 
-}
-
-// ----------------------------------------------------------------------------
-// You should parallelize and optimize from this function exploiting multiple GPUs
-//
-
-
-int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, int batch=1) {
-  // Count the number of the generated tokens
-  int gen_cnt = 0;
-  int num_reqs = requests->num_reqs;
-  int* next_req = (int*)malloc(sizeof(int));
-  
-  *next_req = 0; // global request index
-
-  thread_args args[MAX_GPU][MAX_REQ];
-  pthread_t threads[MAX_GPU][MAX_REQ];
-  pthread_attr_t attr[MAX_GPU][MAX_REQ];
-  cpu_set_t cpus[MAX_GPU][MAX_REQ];
-
-  printf("num_reqs: %d\n", num_reqs);
-
-  for (int i=0; i<NUM_GPU; i++) {
-    // CHECK_HIP(hipSetDevice(i));
-    for (int j=0; j<MAX_REQ; j++) {
-
-      args[i][j].transformer = transformer;
-      args[i][j].tokenizer = tokenizer;
-      args[i][j].requests = requests;
-      args[i][j].thread_id = j;
-      args[i][j].device_id = i;
-      args[i][j].total_reqs = num_reqs;
-      args[i][j].next_req = next_req;
-
-      pthread_attr_init(&attr[i][j]);
-      CPU_ZERO(&cpus[i][j]);
-      CPU_SET(i * MAX_REQ + j, &cpus[i][j]);
-
-      pthread_attr_setaffinity_np(&attr[i][j], sizeof(cpu_set_t), &cpus[i][j]);
-
-      int rc = pthread_create(&threads[i][j], &attr[i][j], test_worker, args[i] + j);
-      if (rc) {
-        printf("ERROR; return code from pthread_create() is %d\n", rc);
-        exit(-1);
-      }
-    }
   }
 
-  for (int i=0; i<NUM_GPU; i++) {
-    for (int j=0; j<MAX_REQ; j++) {
-      pthread_join(threads[i][j], NULL);
-    }
+  for(int idx = 0; idx < requests->num_reqs; idx++) {
+    free_sampler(&samplers[idx]);
   }
 
-  for (int i=0; i<NUM_GPU; i++) {
-    for (int j=0; j<MAX_REQ; j++) {
-      gen_cnt += cnt_threads[i][j];
-    }
-  }
   return gen_cnt;
 }
 
@@ -378,7 +317,6 @@ int main(int argc, char *argv[]) {
   CHECK_HIP(hipGetDeviceCount(&NUM_GPU));
   printf("Number of Devices: %d\n", NUM_GPU);
 
-  initStreams();
   Transformer transformer;
   build_transformer(&transformer, checkpoint_path);
   if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length

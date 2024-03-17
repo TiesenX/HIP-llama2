@@ -72,7 +72,7 @@ typedef struct {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   TransformerWeights weights_gpu[MAX_GPU]; // the weights of the model
-  RunState state[MAX_GPU][MAX_REQ]; // buffers for the "wave" of activations in the forward pass
+  RunState state[MAX_GPU]; // buffers for the "wave" of activations in the forward pass
   // some more state needed to properly clean up the memory mapping (sigh)
   int fd; // file descriptor for memory mapping
   float* data; // memory mapped data pointer
@@ -127,10 +127,37 @@ typedef struct {
   int *next_req;
 } thread_args;
 
-#include "kernels.h"
+static hipStream_t streams[MAX_GPU];
+static hipEvent_t events[MAX_GPU];
+
+static int layer_begin[MAX_GPU], layer_end[MAX_GPU]; 
 int NUM_GPU = 1;
+
+void initStreams(int n_layers) {
+  for(int i = 0; i < NUM_GPU; i++) {
+    layer_begin[i] = i * n_layers / NUM_GPU;
+    layer_end[i] = (i + 1) * n_layers / NUM_GPU;
+    if (i == NUM_GPU - 1) layer_end[i] = n_layers;
+    
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipStreamCreate(&streams[i]));
+    CHECK_HIP(hipEventCreate(&events[i]));
+  }
+}
+
+void destroyStreams() {
+  for(int i = 0; i < NUM_GPU; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    CHECK_HIP(hipStreamDestroy(streams[i]));
+    CHECK_HIP(hipEventDestroy(events[i]));
+  }
+}
+
+#include "kernels_pipeline.h"
 #ifdef USE_GPU
-void malloc_run_state(RunState* s, Config* p) {
+void malloc_run_state(RunState* s, Config* p, int device_id) {
+    CHECK_HIP(hipSetDevice(device_id));
+
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     CHECK_HIP(hipMalloc((void**)&s->x, p->dim * sizeof(float)));
@@ -246,24 +273,36 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
   unsigned long long n_layers = p->n_layers;
   w->token_embedding_table = ptr;
   ptr += p->vocab_size * p->dim;
+
+  // Layers
   w->rms_att_weight = ptr;
   ptr += n_layers * p->dim;
+
   w->wq = ptr;
   ptr += n_layers * p->dim * (p->n_heads * head_size);
+
   w->wk = ptr;
   ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+
   w->wv = ptr;
   ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+
   w->wo = ptr;
   ptr += n_layers * (p->n_heads * head_size) * p->dim;
+
   w->rms_ffn_weight = ptr;
   ptr += n_layers * p->dim;
+  
   w->w1 = ptr;
   ptr += n_layers * p->dim * p->hidden_dim;
+
   w->w2 = ptr;
   ptr += n_layers * p->hidden_dim * p->dim;
+
   w->w3 = ptr;
   ptr += n_layers * p->dim * p->hidden_dim;
+  // End layers
+
   w->rms_final_weight = ptr;
   ptr += p->dim;
   ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
@@ -271,6 +310,70 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
   w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
+void init_weights_gpu(TransformerWeights* weights, TransformerWeights* weights_gpu, Config* p, int shared_weights, size_t weights_size, int device) {
+  CHECK_HIP(hipSetDevice(device));
+
+  int head_size = p->dim / p->n_heads;
+
+  if (device == 0) {
+    CHECK_HIP(hipMalloc((void**)&weights_gpu->token_embedding_table, p->vocab_size * p->dim * sizeof(float)));
+    CHECK_HIP(hipMemcpy(weights_gpu->token_embedding_table, weights->token_embedding_table, p->vocab_size * p->dim * sizeof(float), hipMemcpyHostToDevice));
+  }
+
+  // layers
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->rms_att_weight, (layer_end[device] - layer_begin[device]) * p->dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->rms_att_weight, weights->rms_att_weight + layer_begin[device] * p->dim, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->wq, (layer_end[device] - layer_begin[device]) * p->dim * p->n_heads * head_size * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->wq, weights->wq + layer_begin[device] * p->dim * p->n_heads * head_size, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * p->n_heads * head_size * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->wk, (layer_end[device] - layer_begin[device]) * p->dim * p->n_kv_heads * head_size * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->wk, weights->wk + layer_begin[device] * p->dim * p->n_kv_heads * head_size, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * p->n_kv_heads * head_size * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->wv, (layer_end[device] - layer_begin[device]) * p->dim * p->n_kv_heads * head_size * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->wv, weights->wv + layer_begin[device] * p->dim * p->n_kv_heads * head_size, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * p->n_kv_heads * head_size * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->wo, (layer_end[device] - layer_begin[device]) * p->n_heads * head_size * p->dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->wo, weights->wo + layer_begin[device] * p->n_heads * head_size * p->dim, 
+                      (layer_end[device] - layer_begin[device]) * p->n_heads * head_size * p->dim * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->rms_ffn_weight, (layer_end[device] - layer_begin[device]) * p->dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->rms_ffn_weight, weights->rms_ffn_weight + layer_begin[device] * p->dim, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->w1, (layer_end[device] - layer_begin[device]) * p->dim * p->hidden_dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->w1, weights->w1 + layer_begin[device] * p->dim * p->hidden_dim, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->w2, (layer_end[device] - layer_begin[device]) * p->hidden_dim * p->dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->w2, weights->w2 + layer_begin[device] * p->hidden_dim * p->dim, 
+                      (layer_end[device] - layer_begin[device]) * p->hidden_dim * p->dim * sizeof(float), hipMemcpyHostToDevice));
+
+  CHECK_HIP(hipMalloc((void**)&weights_gpu->w3, (layer_end[device] - layer_begin[device]) * p->dim * p->hidden_dim * sizeof(float)));
+  CHECK_HIP(hipMemcpy(weights_gpu->w3, weights->w3 + layer_begin[device] * p->dim * p->hidden_dim, 
+                      (layer_end[device] - layer_begin[device]) * p->dim * p->hidden_dim * sizeof(float), hipMemcpyHostToDevice));
+  // End layers
+
+  if (device == NUM_GPU - 1) {
+    CHECK_HIP(hipMalloc((void**)&weights_gpu->rms_final_weight, p->dim * sizeof(float)));
+    CHECK_HIP(hipMemcpy(weights_gpu->rms_final_weight, weights->rms_final_weight, p->dim * sizeof(float), hipMemcpyHostToDevice));
+    if (shared_weights) {
+      CHECK_HIP(hipMalloc((void**)&weights_gpu->wcls, p->vocab_size * p->dim * sizeof(float)));
+      CHECK_HIP(hipMemcpy(weights_gpu->wcls, weights->wcls, p->vocab_size * p->dim * sizeof(float), hipMemcpyHostToDevice));
+    }
+    else {
+      size_t offset = weights->wcls - weights->token_embedding_table;
+      size_t wcls_size = weights_size - offset;
+      CHECK_HIP(hipMalloc((void**)&weights_gpu->wcls, wcls_size * sizeof(float)));
+      CHECK_HIP(hipMemcpy(weights_gpu->wcls, weights->wcls, wcls_size * sizeof(float), hipMemcpyHostToDevice));
+    }
+  }
+  printf("DONE INIT WEIGHT ON GPU %d, layer from %d to %d\n", device, layer_begin[device], layer_end[device]);
+}
 
 void read_checkpoint(char* checkpoint, Transformer* t) {
     Config* config = &t->config; 
@@ -297,22 +400,22 @@ void read_checkpoint(char* checkpoint, Transformer* t) {
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
 
 #ifdef USE_GPU
-    // allocate & copy mmap data to the gpu first
-    // TODO: allocate & copy just a portion to the GPU if the weights are too big
-    // to fit in the GPU, then copy the data only as needed while running.
-    float* weights_ptr[NUM_GPU];
-    size_t weights_size = *file_size - sizeof(Config);
+    // Pipeline Parallel model
+    int n_layers = config->n_layers;
+    initStreams(n_layers);
+
+    float* weights_ptr = *data + sizeof(Config)/sizeof(float);
+    size_t weights_size = (*file_size - sizeof(Config)) / sizeof(float);
+
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
 
     #pragma omp parallel for
     for (int device = 0; device < NUM_GPU; device++) {
-        CHECK_HIP(hipSetDevice(device));
-        CHECK_HIP(hipMalloc((void**)&weights_ptr[device], weights_size));
-        CHECK_HIP(hipMemcpy(weights_ptr[device], *data + sizeof(Config)/sizeof(float), weights_size, hipMemcpyHostToDevice));
-        memory_map_weights(&t->weights_gpu[device], config, weights_ptr[device], shared_weights);
+        // init and copy weights to GPUs
+        init_weights_gpu(weights, &t->weights_gpu[device], config, shared_weights, weights_size, device);
 
         // allocate the RunState buffers
-        for (int thread = 0; thread < MAX_REQ; thread++)
-            malloc_run_state(&t->state[device][thread], &t->config);
+        malloc_run_state(&t->state[device], &t->config, device);
     }
 
 #elif KERNEL_TEST
@@ -357,9 +460,7 @@ void free_transformer(Transformer* t) {
     for (int i=0; i<NUM_GPU; i++) {
         CHECK_HIP(hipSetDevice(i));
         CHECK_HIP(hipFree(t->weights_gpu[i].token_embedding_table));
-        for (int j=0; j<MAX_REQ; j++) {
-          free_run_state(&t->state[i][j]);
-        }
+        free_run_state(&t->state[i]);
     }
 }
 

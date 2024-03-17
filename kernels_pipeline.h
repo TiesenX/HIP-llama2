@@ -1,5 +1,5 @@
 #pragma once
-#include "build.h"
+#include "build_pipeline.h"
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -108,8 +108,8 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size) {
         o[i] = weight[i] * (ss * x[i]);
     }
 }
-void gpu_rmsnorm(float* o, float* x, float* weight, int size, hipStream_t *stream) {
-    rmsnorm_kernel <<<1, num_threads_lrg, 0, *stream >>> (o, x, weight, size);
+void gpu_rmsnorm(float* o, float* x, float* weight, int size, hipStream_t& stream) {
+    rmsnorm_kernel <<<1, num_threads_lrg , 0, stream>>> (o, x, weight, size);
 }
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
@@ -203,8 +203,8 @@ __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
   }
 }
 
-void gpu_matmul(float* xout, float* x, float* w, int n, int d, hipStream_t *stream) {
-  matmul_kernel<<<d, 512, 0, *stream>>>(xout, x, w, n, d);
+void gpu_matmul(float* xout, float* x, float* w, int n, int d, hipStream_t& stream) {
+  matmul_kernel<<<d, 512, 0, stream>>>(xout, x, w, n, d);
   CHECK_HIP(hipGetLastError());
 }
 
@@ -241,10 +241,10 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
     vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
-void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, hipStream_t *stream) {
+void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, hipStream_t& stream) {
   dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  RoPE_kernel<<<grid, block, 0, *stream>>>(pos, sq, sk, dim, kv_dim, head_size);
+  RoPE_kernel<<<grid, block, 0, stream>>>(pos, sq, sk, dim, kv_dim, head_size);
   CHECK_HIP(hipGetLastError());
 }
 
@@ -306,9 +306,9 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
 }
 
 void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, 
-                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, hipStream_t *stream) {
-    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg, 0, *stream>>> (output, q, key_cache, value_cache, 
-                                                                            kv_dim, kv_mul, head_size, loff, seq_len);
+                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, hipStream_t& stream) {
+    MultiHeadAttention_kernel <<<num_heads, num_threads_lrg, 0, stream>>> (output, q, key_cache, value_cache, 
+                                                                kv_dim, kv_mul, head_size, loff, seq_len);
 }
 
 void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
@@ -363,8 +363,8 @@ __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
         shb[i] = val;
     }
 }
-void gpu_swiglu(float *shb, float *shb2, int hidden_dim, hipStream_t *stream) {
-    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, *stream>>>(shb, shb2, hidden_dim);
+void gpu_swiglu(float *shb, float *shb2, int hidden_dim, hipStream_t& stream) {
+    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, stream>>>(shb, shb2, hidden_dim);
 }
 
 void swiglu(float *shb, float *shb2, int hidden_dim) {
@@ -384,8 +384,8 @@ __global__ void accum_kernel(float* a, float* b, int size) {
       a[i] += b[i];
   }
 }
-void gpu_accum(float *a, float *b, int size, hipStream_t *stream) {
-  accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, *stream>>>(a,b,size);
+void gpu_accum(float *a, float *b, int size, hipStream_t& stream) {
+  accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, stream>>>(a,b,size);
 }
 
 void accum(float *a, float *b, int size) {
