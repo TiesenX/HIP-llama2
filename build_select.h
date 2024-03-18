@@ -2,7 +2,7 @@
 
 #define USE_GPU 1
 #define MAX_GPU 4
-#define MAX_REQ 2
+#define MAX_REQ 1
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -65,6 +65,9 @@ typedef struct {
   // kv cache
   float* key_cache;   // (layer, seq_len, dim)
   float* value_cache; // (layer, seq_len, dim)
+
+  float* test1; // (layer, seq_len, dim)
+  float* test2; // (layer, seq_len, dim)
 } RunState;
 
 
@@ -127,7 +130,7 @@ typedef struct {
   int *next_req;
 } thread_args;
 
-int BATCH_SIZE = 2;
+int BATCH_SIZE = 3;
 #include "kernels_select.h"
 int NUM_GPU = 1;
 #ifdef USE_GPU
@@ -142,8 +145,11 @@ void malloc_run_state(RunState* s, Config* p) {
     CHECK_HIP(hipMalloc((void**)&s->q, p->dim * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->k, kv_dim * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->v, kv_dim * BATCH_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE * sizeof(float)));
+
+    // need adjustment
+    CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
+
     CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * BATCH_SIZE * sizeof(float), hipMemAllocationTypePinned));

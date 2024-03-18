@@ -36,7 +36,7 @@
 // ----------------------------------------------------------------------------
 // Forward inference
 
-float* forward(Transformer* transformer, int* token, int pos, int device_id, int thread_id, hipStream_t *stream) {
+float* forward(Transformer* transformer, int* token, int pos, int device_id, int thread_id, int batch_size, hipStream_t *stream) {
 
   // a few convenience variables
   Config* p = &transformer->config;
@@ -50,7 +50,7 @@ float* forward(Transformer* transformer, int* token, int pos, int device_id, int
   int head_size = dim / p->n_heads;
 
   // copy the token embedding into x
-  for (int idx = 0; idx < BATCH_SIZE; idx++) {
+  for (int idx = 0; idx < batch_size; idx++) {
     float* content_row = w->token_embedding_table + token[idx] * dim;
     CHECK_HIP(hipMemcpyAsync(&x[idx * dim], content_row, dim*sizeof(*x), hipMemcpyDeviceToDevice, *stream));
   }
@@ -60,56 +60,56 @@ float* forward(Transformer* transformer, int* token, int pos, int device_id, int
   for(unsigned long long l = 0; l < p->n_layers; l++) {
     // printf("Layer: %llu\n", l);
     // attention rmsnorm
-    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, BATCH_SIZE, stream);
+    gpu_rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, batch_size, stream);
 
     // save key,value at this time step (pos) to our kv cache
-    int loff = l * p->seq_len * kv_dim * BATCH_SIZE; // kv cache layer offset for convenience
-    s->k = s->key_cache + loff + pos * kv_dim * BATCH_SIZE;
-    s->v = s->value_cache + loff + pos * kv_dim * BATCH_SIZE;
+    int loff = l * p->seq_len * kv_dim * batch_size; // kv cache layer offset for convenience
+    s->k = s->key_cache + loff + pos * kv_dim * batch_size;
+    s->v = s->value_cache + loff + pos * kv_dim * batch_size;
 
     // qkv matmuls for this position
-    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, BATCH_SIZE, stream);
-    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, BATCH_SIZE, stream);
-    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, BATCH_SIZE, stream);
+    gpu_matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, batch_size, stream);
+    gpu_matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, batch_size, stream);
+    gpu_matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, batch_size, stream);
 
-    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, BATCH_SIZE, stream);
+    gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, batch_size, stream);
 
-    for (int idx = 0; idx < BATCH_SIZE; idx++) {
+    for (int idx = 0; idx < batch_size; idx++) {
       gpu_MultiHeadAttention(s->xb + idx * dim, 
                              s->q + idx * dim, 
                              s->key_cache, s->value_cache, 
-                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, BATCH_SIZE, stream);
+                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, batch_size, stream);
     }
 
     // final matmul to get the output of the attention
-    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, BATCH_SIZE, stream);
+    gpu_matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, batch_size, stream);
 
     // residual connection back into x
-    gpu_accum(x, s->xb2, dim, BATCH_SIZE, stream);
+    gpu_accum(x, s->xb2, dim, batch_size, stream);
 
     // ffn rmsnorm
-    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, BATCH_SIZE, stream);
+    gpu_rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, batch_size, stream);
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
-    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, BATCH_SIZE, stream);
-    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, BATCH_SIZE, stream);
+    gpu_matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, batch_size, stream);
+    gpu_matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, batch_size, stream);
 
     // SwiGLU non-linearity
-    gpu_swiglu(s->hb, s->hb2, hidden_dim, BATCH_SIZE, stream);
+    gpu_swiglu(s->hb, s->hb2, hidden_dim, batch_size, stream);
 
     // final matmul to get the output of the ffn
-    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, BATCH_SIZE, stream);
+    gpu_matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, batch_size, stream);
 
     // residual connection
-    gpu_accum(x, s->xb, dim, BATCH_SIZE, stream);
+    gpu_accum(x, s->xb, dim, batch_size, stream);
   }
 
   // final rmsnorm
-  gpu_rmsnorm(x, x, w->rms_final_weight, dim, BATCH_SIZE, stream);
+  gpu_rmsnorm(x, x, w->rms_final_weight, dim, batch_size, stream);
   // classifier into logits
-  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size, BATCH_SIZE, stream);
-  CHECK_HIP(hipMemcpyAsync(s->logits, s->logits_gpu, p->vocab_size * BATCH_SIZE * sizeof(float), hipMemcpyDeviceToHost, *stream));
+  gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size, batch_size, stream);
+  CHECK_HIP(hipMemcpyAsync(s->logits, s->logits_gpu, p->vocab_size * batch_size * sizeof(float), hipMemcpyDeviceToHost, *stream));
 
   return s->logits;
 }
@@ -156,7 +156,11 @@ void* test_worker(void* args) {
     // --------------------------------------------------------------
     pthread_mutex_lock(&mutex);
     current_req = *next_req;
-    *next_req = *next_req + BATCH_SIZE;
+    int current_batch_size = BATCH_SIZE;
+    if (current_req + current_batch_size > targs->total_reqs) {
+        current_batch_size = targs->total_reqs - current_req;
+    }
+    *next_req = *next_req + current_batch_size;
     pthread_mutex_unlock(&mutex);
     if (current_req >= targs->total_reqs) {
       break;
@@ -165,19 +169,19 @@ void* test_worker(void* args) {
 
     // Avoid randomness to generate tokens for batch input
     // Each input request has its Sampler each
-    Sampler sampler[BATCH_SIZE];
+    Sampler sampler[current_batch_size];
     // Loop for the multiple requests
-    std::string gen_str[BATCH_SIZE];
-    char* prompt[BATCH_SIZE];
-    int* prompt_tokens[BATCH_SIZE];
+    std::string gen_str[current_batch_size];
+    char* prompt[current_batch_size];
+    int* prompt_tokens[current_batch_size];
     // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens[BATCH_SIZE];
-    int next[BATCH_SIZE];
-    int token[BATCH_SIZE];
-    int end_request[BATCH_SIZE];
-    int cnt_tokens[BATCH_SIZE];
+    int num_prompt_tokens[current_batch_size];
+    int next[current_batch_size];
+    int token[current_batch_size];
+    int end_request[current_batch_size];
+    int cnt_tokens[current_batch_size];
 
-    for (int idx = 0; idx < BATCH_SIZE; idx++) {
+    for (int idx = 0; idx < current_batch_size; idx++) {
       end_request[idx] = 0;
       cnt_tokens[idx] = 0;
       prompt[idx] = get_str_req_ptr(requests, current_req + idx);
@@ -203,11 +207,11 @@ void* test_worker(void* args) {
     while (pos < steps) {
       // forward the transformer to get logits for the next token
       // printf("\npos: %d, token: %d\n", pos, token);
-      float* logits = forward(transformer, token, pos, device_id, thread_id, &streams[device_id][thread_id]);
+      float* logits = forward(transformer, token, pos, device_id, thread_id, current_batch_size, &streams[device_id][thread_id]);
       CHECK_HIP(hipStreamSynchronize(streams[device_id][thread_id]));
       // printf("Pass forward\n");
 
-      for (int idx = 0; idx < BATCH_SIZE; idx++) {
+      for (int idx = 0; idx < current_batch_size; idx++) {
         // advance the state machine
         if (pos < num_prompt_tokens[idx] - 1) {
           // if we are still processing the input prompt, force the next prompt token
@@ -222,7 +226,7 @@ void* test_worker(void* args) {
       pos++;
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
-      for (int idx = 0; idx < BATCH_SIZE; idx++) {
+      for (int idx = 0; idx < current_batch_size; idx++) {
         if (next[idx] == 1 || next[idx] == 2) {
           end_request[idx] = 1;
           if (cnt_tokens[idx] == 0) cnt_tokens[idx] = pos;
@@ -230,7 +234,7 @@ void* test_worker(void* args) {
       }
 
       bool end = true;
-      for (int idx = 0; idx < BATCH_SIZE; idx++) {
+      for (int idx = 0; idx < current_batch_size; idx++) {
         if (end_request[idx] != 1) {
           end = false;
         }
@@ -238,9 +242,9 @@ void* test_worker(void* args) {
       if (end) break;
 
       // print the token as string, decode it with the Tokenizer object
-      char* piece[BATCH_SIZE];
+      char* piece[current_batch_size];
       
-      for (int idx = 0; idx < BATCH_SIZE; idx++) {
+      for (int idx = 0; idx < current_batch_size; idx++) {
         if (end_request[idx] != 1){
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
           // You don't need to print every tokens are generated.
@@ -261,7 +265,7 @@ void* test_worker(void* args) {
     }
     printf("\n");
 
-    for (int idx = 0; idx < BATCH_SIZE; idx++) {
+    for (int idx = 0; idx < current_batch_size; idx++) {
       gen_str[idx] += "\n";
       strcpy(get_str_gen_ptr(requests, current_req + idx), gen_str[idx].c_str());
       free(prompt_tokens[idx]);
@@ -272,7 +276,7 @@ void* test_worker(void* args) {
     if (pos > 1) {
       long end = time_in_ms();
       int sum_tokens = 0;
-      for (int idx = 0; idx < BATCH_SIZE; idx++) {
+      for (int idx = 0; idx < current_batch_size; idx++) {
         sum_tokens += cnt_tokens[idx] - 1;
       }
       fprintf(stderr, "achieved tok/s: %f\n", sum_tokens / (double)(end-start)*1000);
