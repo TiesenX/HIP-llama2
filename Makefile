@@ -11,6 +11,10 @@ runcpu: run.cc
 rungpu: run.cc
 	$(CC) -DUSE_GPU -o runcc run.cc -O2 --offload-arch=gfx908 -fopenmp
 
+.PHONY: runselect
+runselect: run_select.cc
+	$(CC) -DUSE_GPU -o runselect run_select.cc -O2 --offload-arch=gfx908 -fopenmp
+
 .PHONY: run13B
 run13B: run_13B.cc
 	$(CC) -DUSE_GPU -o run13B run_13B.cc -O2 --offload-arch=gfx908 -fopenmp
