@@ -75,17 +75,10 @@ float* forward(Transformer* transformer, int* token, int pos, int device_id, int
     gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, BATCH_SIZE, stream);
 
     for (int idx = 0; idx < BATCH_SIZE; idx++) {
-      // gpu_MultiHeadAttention(s->xb + idx * dim, 
-      //                        s->q + idx * dim, 
-      //                        s->key_cache, s->value_cache, 
-      //                        kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, stream);
-      gpu_MultiHeadAttention(s->q + idx * dim,
-                           s->att + idx * p->n_heads * p->seq_len,
-                           s->key_cache,
-                           s->xb + idx * dim,
-                           s->value_cache,
-                           pos, p->seq_len, p->n_heads,
-                           kv_dim, kv_mul, head_size, loff, idx, BATCH_SIZE, stream);
+      gpu_MultiHeadAttention(s->xb + idx * dim, 
+                             s->q + idx * dim, 
+                             s->key_cache, s->value_cache, 
+                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, BATCH_SIZE, stream);
     }
 
     // final matmul to get the output of the attention
