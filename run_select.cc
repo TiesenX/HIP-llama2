@@ -74,6 +74,7 @@ float* forward(Transformer* transformer, int* token, int pos, int device_id, int
 
     gpu_RoPE(s->q, s->k, pos, dim, head_size, kv_dim, batch_size, stream);
 
+    // #pragma omp parallel for
     for (int idx = 0; idx < batch_size; idx++) {
       gpu_MultiHeadAttention(s->xb + idx * dim, 
                              s->q + idx * dim, 
@@ -152,8 +153,6 @@ void* test_worker(void* args) {
   int gen_cnt = 0;
   
   while(true) {
-    // Need handle when num req can not divide by batch size
-    // --------------------------------------------------------------
     pthread_mutex_lock(&mutex);
     current_req = *next_req;
     int current_batch_size = BATCH_SIZE;
@@ -165,7 +164,6 @@ void* test_worker(void* args) {
     if (current_req >= targs->total_reqs) {
       break;
     }
-    // --------------------------------------------------------------
 
     // Avoid randomness to generate tokens for batch input
     // Each input request has its Sampler each
@@ -184,6 +182,7 @@ void* test_worker(void* args) {
     for (int idx = 0; idx < current_batch_size; idx++) {
       end_request[idx] = 0;
       cnt_tokens[idx] = 0;
+      
       prompt[idx] = get_str_req_ptr(requests, current_req + idx);
       prompt_tokens[idx] = (int*)malloc((strlen(prompt[idx])+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
       gen_str[idx] = "";
@@ -227,41 +226,40 @@ void* test_worker(void* args) {
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
       for (int idx = 0; idx < current_batch_size; idx++) {
-        if (next[idx] == 1 || next[idx] == 2) {
-          end_request[idx] = 1;
-          if (cnt_tokens[idx] == 0) cnt_tokens[idx] = pos;
+        if ((next[idx] == 1 || next[idx] == 2) && !end_request[idx]) {
+          end_request[idx] = true;
         }
       }
 
-      bool end = true;
+      bool stop = true;
       for (int idx = 0; idx < current_batch_size; idx++) {
-        if (end_request[idx] != 1) {
-          end = false;
+        if (!end_request[idx]) {
+          stop = false;
         }
       }
-      if (end) break;
+      if (stop) break;
 
       // print the token as string, decode it with the Tokenizer object
       char* piece[current_batch_size];
       
       for (int idx = 0; idx < current_batch_size; idx++) {
-        if (end_request[idx] != 1){
+        if (!end_request[idx]){
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
           // You don't need to print every tokens are generated.
           // {
-          // safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
+          safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
           fflush(stdout);
           // }
           // gen_str += piece;
           append_str(piece[idx], gen_str[idx]);
           token[idx] = next[idx];
+          cnt_tokens[idx]++;
         }
       }
 
       // init the timer here because the first iteration can be slower
       // this timer is not important
       if (start == 0) { start = time_in_ms(); }
-
     }
     printf("\n");
 
@@ -277,9 +275,11 @@ void* test_worker(void* args) {
       long end = time_in_ms();
       int sum_tokens = 0;
       for (int idx = 0; idx < current_batch_size; idx++) {
-        sum_tokens += cnt_tokens[idx] - 1;
+        printf("\nRequest %d: %d tokens\n", current_req + idx, cnt_tokens[idx]);
+        sum_tokens += cnt_tokens[idx];
       }
       fprintf(stderr, "achieved tok/s: %f\n", sum_tokens / (double)(end-start)*1000);
+      // gen_cnt += (pos - 1) * current_batch_size;
       gen_cnt += sum_tokens;
     }
     printf("End of the request\n");

@@ -2,7 +2,12 @@
 
 #define USE_GPU 1
 #define MAX_GPU 4
-#define MAX_REQ 2
+
+// for streaming
+#define MAX_THREAD 2
+
+// for selective batching
+int BATCH_SIZE = 2;
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -128,7 +133,7 @@ typedef struct {
 } thread_args;
 
 static hipStream_t streams[MAX_GPU];
-static hipEvent_t events[MAX_GPU];
+static hipEvent_t events[MAX_THREAD][MAX_GPU];
 
 static int layer_begin[MAX_GPU], layer_end[MAX_GPU]; 
 int NUM_GPU = 1;
@@ -138,18 +143,27 @@ void initStreams(int n_layers) {
     layer_begin[i] = i * n_layers / NUM_GPU;
     layer_end[i] = (i + 1) * n_layers / NUM_GPU;
     if (i == NUM_GPU - 1) layer_end[i] = n_layers;
-    
     CHECK_HIP(hipSetDevice(i));
     CHECK_HIP(hipStreamCreate(&streams[i]));
-    CHECK_HIP(hipEventCreate(&events[i]));
+  }
+  for (int i = 0; i < MAX_THREAD; i++) {
+    for(int j = 0; j < NUM_GPU; j++) {
+      CHECK_HIP(hipSetDevice(j));
+      CHECK_HIP(hipEventCreate(&events[i][j]));
+    }
   }
 }
 
 void destroyStreams() {
-  for(int i = 0; i < NUM_GPU; i++) {
+  for (int i = 0; i < MAX_THREAD; i++) {
+    for(int j = 0; j < NUM_GPU; j++) {
+      CHECK_HIP(hipSetDevice(j));
+      CHECK_HIP(hipEventDestroy(events[i][j]));
+    }
+  }
+  for (int i = 0; i < NUM_GPU; i++) {
     CHECK_HIP(hipSetDevice(i));
     CHECK_HIP(hipStreamDestroy(streams[i]));
-    CHECK_HIP(hipEventDestroy(events[i]));
   }
 }
 
@@ -160,19 +174,22 @@ void malloc_run_state(RunState* s, Config* p, int device_id) {
 
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    CHECK_HIP(hipMalloc((void**)&s->x, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->xb, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->xb2, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->hb, p->hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->q, p->dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->k, kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->v, kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float)));
-    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * sizeof(float), hipMemAllocationTypePinned));
+    CHECK_HIP(hipMalloc((void**)&s->x, p->dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->xb, p->dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->xb2, p->dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->hb, p->hidden_dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->hb2, p->hidden_dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->q, p->dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->k, kv_dim * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->v, kv_dim * BATCH_SIZE * sizeof(float)));
+
+    // need adjustment
+    CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
+
+    CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * BATCH_SIZE * sizeof(float)));
+    CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * BATCH_SIZE * sizeof(float), hipMemAllocationTypePinned));
     // s->logits = (float *)calloc(p->vocab_size, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q

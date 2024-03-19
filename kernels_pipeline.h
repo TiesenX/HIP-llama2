@@ -108,8 +108,10 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size) {
         o[i] = weight[i] * (ss * x[i]);
     }
 }
-void gpu_rmsnorm(float* o, float* x, float* weight, int size, hipStream_t& stream) {
-    rmsnorm_kernel <<<1, num_threads_lrg , 0, stream>>> (o, x, weight, size);
+void gpu_rmsnorm(float* o, float* x, float* weight, int size, int batch_size, hipStream_t& stream) {
+  #pragma omp parallel for
+  for (int idx = 0; idx < batch_size; idx++)
+    rmsnorm_kernel <<<1, num_threads_lrg , 0, stream>>> (o + idx * size, x + idx * size, weight, size);
 }
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
@@ -185,27 +187,55 @@ void softmax(float* x, int size) {
   }
 }
 
+// __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+
+//   // W (d,n) @ x (n,) -> xout (d,)
+//   // by far the most amount of time is spent inside this little function
+//   int i = blockIdx.x * blockDim.x + threadIdx.x;
+//   int d_i = blockIdx.x;
+//   float val = 0.0f;
+
+//   for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+//     val += w[d_i * n + idx] * x[idx];
+//   }
+//   val = blockReduceSum(val);
+
+//   if (threadIdx.x == 0) {
+//     xout[d_i] = val;
+//   }
+// }
+
+// void gpu_matmul(float* xout, float* x, float* w, int n, int d, int batch_size, hipStream_t& stream) {
+//   #pragma omp parallel for
+//   for (int idx = 0; idx < batch_size; idx++)
+//     matmul_kernel<<<d, 512, 0, stream>>>(xout + idx * d, x + idx * n, w, n, d);
+//     // CHECK_HIP(hipGetLastError());
+// }
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int d_i = blockIdx.x;
+  int batch_i = blockIdx.y;
   float val = 0.0f;
 
   for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
-    val += w[d_i * n + idx] * x[idx];
+    val += w[d_i * n + idx] * x[n * batch_i + idx];
   }
   val = blockReduceSum(val);
 
   if (threadIdx.x == 0) {
-    xout[d_i] = val;
+    xout[batch_i * d + d_i] = val;
   }
 }
 
-void gpu_matmul(float* xout, float* x, float* w, int n, int d, hipStream_t& stream) {
-  matmul_kernel<<<d, 512, 0, stream>>>(xout, x, w, n, d);
-  CHECK_HIP(hipGetLastError());
+void gpu_matmul(float* xout, float* x, float* w, int n, int d, int batch_size, hipStream_t& stream) {
+  // for (int idx = 0; idx < batch_size; idx++)
+  dim3 grid(d, batch_size);
+  // printf("batch_size: %d\n", batch_size);
+  matmul_kernel<<<grid, 512, 0, stream>>>(xout, x, w, n, d);
+    // CHECK_HIP(hipGetLastError());
 }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
@@ -241,11 +271,14 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
     vec[i+1] = v0 * fci + v1 * fcr;
   }
 }
-void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, hipStream_t& stream) {
+void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim, int batch_size, hipStream_t& stream) {
   dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
-  RoPE_kernel<<<grid, block, 0, stream>>>(pos, sq, sk, dim, kv_dim, head_size);
-  CHECK_HIP(hipGetLastError());
+
+  #pragma omp parallel for
+  for (int idx = 0; idx < batch_size; idx++)
+    RoPE_kernel<<<grid, block, 0, stream>>>(pos, sq + idx * dim, sk + idx * dim, dim, kv_dim, head_size);
+  // CHECK_HIP(hipGetLastError());
 }
 
 void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) { //s->q, s->k, freq_cis_real_row, freq_cis_imag_row, p->n_heads, head_size) {
@@ -269,7 +302,7 @@ void RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim) { /
 #define MAX_SEQ_LEN 8192
 __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const float* __restrict__ sq,
     const float* __restrict__ key_cache, const float* __restrict__ value_cache,
-    int kv_dim, int kv_mul, int head_size, int loff, int seq_len) {
+    int kv_dim, int kv_mul, int head_size, int loff, int seq_len, int batch, int batch_size) {
 
     int h = blockIdx.x;
 
@@ -281,7 +314,8 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // iterate over all timesteps, including the current one
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x) {
         // get the key vector for this head and at this timestep
-        const float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        // const float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+        const float* k = key_cache + loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
@@ -300,15 +334,17 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         for (int t = 0; t < seq_len; t++)
-            val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
+            // val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
+            val += att[t] * value_cache[loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size + i];
+              // float *v = s_valuecache + loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size;
         output[(h / kv_mul) * head_size + i] = val;
     }
 }
 
 void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, 
-                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, hipStream_t& stream) {
+                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, int batch, int batch_size, hipStream_t& stream) {
     MultiHeadAttention_kernel <<<num_heads, num_threads_lrg, 0, stream>>> (output, q, key_cache, value_cache, 
-                                                                kv_dim, kv_mul, head_size, loff, seq_len);
+                                                                            kv_dim, kv_mul, head_size, loff, seq_len, batch, batch_size);
 }
 
 void MultiHeadAttention(int pos, Config* p, RunState* s, int kv_dim, int kv_mul, int head_size, int loff) {
@@ -363,8 +399,10 @@ __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
         shb[i] = val;
     }
 }
-void gpu_swiglu(float *shb, float *shb2, int hidden_dim, hipStream_t& stream) {
-    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, stream>>>(shb, shb2, hidden_dim);
+void gpu_swiglu(float *shb, float *shb2, int hidden_dim, int batch_size, hipStream_t& stream) {
+  #pragma omp parallel for
+  for (int idx = 0; idx < batch_size; idx++)
+    swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, stream>>>(shb + idx * hidden_dim, shb2 + idx * hidden_dim, hidden_dim);
 }
 
 void swiglu(float *shb, float *shb2, int hidden_dim) {
@@ -384,8 +422,10 @@ __global__ void accum_kernel(float* a, float* b, int size) {
       a[i] += b[i];
   }
 }
-void gpu_accum(float *a, float *b, int size, hipStream_t& stream) {
-  accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, stream>>>(a,b,size);
+void gpu_accum(float *a, float *b, int size, int batch_size, hipStream_t& stream) {
+  #pragma omp parallel for
+  for (int idx = 0; idx < batch_size; idx++)
+    accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, stream>>>(a + idx * size, b + idx * size, size);
 }
 
 void accum(float *a, float *b, int size) {

@@ -2,7 +2,9 @@
 
 #define USE_GPU 1
 #define MAX_GPU 4
-#define MAX_REQ 1
+
+#define MAX_REQ 3
+int BATCH_SIZE = 1;
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -130,7 +132,6 @@ typedef struct {
   int *next_req;
 } thread_args;
 
-int BATCH_SIZE = 3;
 #include "kernels_select.h"
 int NUM_GPU = 1;
 #ifdef USE_GPU
