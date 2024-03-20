@@ -251,7 +251,6 @@ void* test_worker(void* args) {
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
       
-      #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if ((next[idx] == 1 || next[idx] == 2) && !end_request[idx]) {
           end_request[idx] = true;
@@ -269,7 +268,6 @@ void* test_worker(void* args) {
       // print the token as string, decode it with the Tokenizer object
       char* piece[current_batch_size];
       
-      #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if (!end_request[idx]){
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
@@ -291,7 +289,6 @@ void* test_worker(void* args) {
     }
     printf("\n");
 
-    #pragma omp parallel for
     for (int idx = 0; idx < current_batch_size; idx++) {
       gen_str[idx] += "\n";
       strcpy(get_str_gen_ptr(requests, current_req + idx), gen_str[idx].c_str());
