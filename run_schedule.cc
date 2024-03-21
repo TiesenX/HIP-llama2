@@ -32,6 +32,17 @@
     }                                                                                    \
   } while (0)
 
+static hipStream_t streams[MAX_GPU][BATCH_SIZE];
+
+void init_streams() {
+  for(int i = 0; i < NUM_GPU; i++) {
+    CHECK_HIP(hipSetDevice(i));
+    for(int j = 0; j < BATCH_SIZE; j++) {
+      CHECK_HIP(hipStreamCreate(&streams[i][j]));
+    }
+  }
+}
+
 void forward(Transformer *transformer, int *token, int *pos, int batch_size, float *logits, int device_id, int *new_batch_slot) {
   CHECK_HIP(hipSetDevice(device_id));
   // a few convenience variables
@@ -80,11 +91,15 @@ void forward(Transformer *transformer, int *token, int *pos, int batch_size, flo
     gpu_RoPE(s->q, s->key_cache + loff, pos, dim, head_size, kv_dim, new_batch_slot, batch_size);
 
     // multihead attention. iterate over all heads
+    #pragma unroll
     for (int idx = 0; idx < batch_size; idx++) {
       gpu_MultiHeadAttention(s->xb + idx * dim, 
                              s->q + idx * dim, 
                              s->key_cache, s->value_cache, 
-                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos[idx]+1, new_batch_slot[idx], BATCH_SIZE);
+                             kv_dim, kv_mul, p->n_heads, head_size, loff, pos[idx]+1, new_batch_slot[idx], BATCH_SIZE, &streams[device_id][idx]);
+    }
+    for (int idx = 0; idx < batch_size; idx++) {
+      CHECK_HIP(hipStreamSynchronize(streams[device_id][idx]));
     }
 
     // final matmul to get the output of the attention
@@ -461,6 +476,7 @@ int main(int argc, char *argv[]) {
     }
 
     init_prompt_state(&requests, &tokenizer);
+    init_streams();
     Sampler samplers[requests.num_reqs];
     for (int idx = 0; idx < requests.num_reqs; idx++)
     {

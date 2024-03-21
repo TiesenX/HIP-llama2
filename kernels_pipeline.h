@@ -316,6 +316,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // weighted sum of the values, store back into xb
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
+        #pragma unroll
         for (int t = 0; t < seq_len; t++)
             // val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
             val += att[t] * value_cache[loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size + i];

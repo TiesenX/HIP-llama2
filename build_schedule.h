@@ -3,8 +3,7 @@
 #define USE_GPU 1
 #define MAX_GPU 4
 
-#define MAX_REQ 1
-#define BATCH_SIZE 6
+#define BATCH_SIZE 3
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -67,8 +66,6 @@ typedef struct {
   float* key_cache;   // (layer, seq_len, dim)
   float* value_cache; // (layer, seq_len, dim)
 
-  float* test1; // (layer, seq_len, dim)
-  float* test2; // (layer, seq_len, dim)
 } RunState;
 
 

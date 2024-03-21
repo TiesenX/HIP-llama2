@@ -4,7 +4,7 @@
 #define MAX_GPU 4
 
 // for streaming
-#define MAX_THREAD 1
+#define MAX_THREAD 4
 
 // for selective batching
 int BATCH_SIZE = 1;

@@ -473,7 +473,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
         
-        #pragma unroll 23
+        #pragma unroll
         for (int t = 0; t < seq_len; t++)
             // val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
             val += att[t] * value_cache[loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size + i];
@@ -483,8 +483,8 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
 }
 
 void gpu_MultiHeadAttention(float *output, float *q, float *key_cache, float *value_cache, 
-                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, int batch, int batch_size) {
-    MultiHeadAttention_kernel<<<num_heads, num_threads_lrg>>>(output, q, key_cache, value_cache, 
+                            int kv_dim, int kv_mul, int num_heads, int head_size, int loff, int seq_len, int batch, int batch_size, hipStream_t* stream) {
+    MultiHeadAttention_kernel<<<num_heads, num_threads_lrg, 0, *stream>>>(output, q, key_cache, value_cache, 
                                                               kv_dim, kv_mul, head_size, loff, seq_len, batch, batch_size);
 }
 
