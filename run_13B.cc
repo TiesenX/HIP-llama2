@@ -50,7 +50,7 @@ float* forward(Transformer* transformer, int* token, int pos, int batch_size, in
   for (int device_id = 0; device_id < NUM_GPU; device_id++) {
     CHECK_HIP(hipSetDevice(device_id));
     w[device_id] = &transformer->weights_gpu[device_id];
-    s[device_id] = &transformer->state[device_id];
+    s[device_id] = &transformer->state[device_id][thread_id];
   }
 
   CHECK_HIP(hipSetDevice(0));
@@ -65,8 +65,10 @@ float* forward(Transformer* transformer, int* token, int pos, int batch_size, in
   for (int idx = 0; idx < batch_size; idx++) {
     float* content_row = w[0]->token_embedding_table + token[idx] * dim;
     CHECK_HIP(hipMemcpyAsync(x[0] + idx * dim, content_row, dim*sizeof(*(x[0])), hipMemcpyDeviceToDevice, streams[0]));
+    CHECK_HIP(hipStreamSynchronize(streams[0]));
   }
-  CHECK_HIP(hipStreamSynchronize(streams[0]));
+
+  CHECK_HIP(hipDeviceSynchronize());
 
   for (int device_id = 0; device_id < NUM_GPU; device_id++) {
     CHECK_HIP(hipSetDevice(device_id));
@@ -172,8 +174,8 @@ void* test_worker(void* args) {
 
   int current_req;
   int gen_cnt = 0;
-  int total_reqs = BATCH_SIZE * 2;
-  // int total_reqs = targs->total_reqs;
+  // int total_reqs = BATCH_SIZE * 2;
+  int total_reqs = targs->total_reqs;
 
   while(true) {
     pthread_mutex_lock(&mutex);
@@ -202,7 +204,7 @@ void* test_worker(void* args) {
     bool end_request[current_batch_size];
     int cnt_tokens[current_batch_size];
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int idx = 0; idx < current_batch_size; idx++) {
       end_request[idx] = false;
       cnt_tokens[idx] = 0;
@@ -234,7 +236,7 @@ void* test_worker(void* args) {
       float* logits = forward(transformer, token, pos, current_batch_size, thread_id);
       // printf("Pass forward\n");
       
-      #pragma omp parallel for
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         // advance the state machine
         if (pos < num_prompt_tokens[idx] - 1) {
@@ -251,7 +253,7 @@ void* test_worker(void* args) {
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
       
-      #pragma omp parallel for
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if ((next[idx] == 1 || next[idx] == 2) && !end_request[idx]) {
           end_request[idx] = true;
@@ -269,7 +271,7 @@ void* test_worker(void* args) {
       // print the token as string, decode it with the Tokenizer object
       char* piece[current_batch_size];
       
-      #pragma omp parallel for
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if (!end_request[idx]){
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
@@ -291,7 +293,7 @@ void* test_worker(void* args) {
     }
     printf("\n");
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int idx = 0; idx < current_batch_size; idx++) {
       gen_str[idx] += "\n";
       strcpy(get_str_gen_ptr(requests, current_req + idx), gen_str[idx].c_str());
@@ -485,14 +487,14 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    free_requests(&requests);
+    // free_requests(&requests);
 
   } else {
     fprintf(stderr, "unknown mode: %s\n", mode);
     error_usage();
   }
 
-  destroyStreams();
+  // destroyStreams();
   // // memory and file handles cleanup
   // free_sampler(&sampler);
   // free_tokenizer(&tokenizer);

@@ -111,6 +111,7 @@ float* forward(Transformer* transformer, int* token, int pos, int device_id, int
   // classifier into logits
   gpu_matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size, batch_size, stream);
   CHECK_HIP(hipMemcpyAsync(s->logits, s->logits_gpu, p->vocab_size * batch_size * sizeof(float), hipMemcpyDeviceToHost, *stream));
+  CHECK_HIP(hipStreamSynchronize(*stream));
 
   return s->logits;
 }
@@ -207,7 +208,7 @@ void* test_worker(void* args) {
       // forward the transformer to get logits for the next token
       // printf("\npos: %d, token: %d\n", pos, token);
       float* logits = forward(transformer, token, pos, device_id, thread_id, current_batch_size, &streams[device_id][thread_id]);
-      CHECK_HIP(hipStreamSynchronize(streams[device_id][thread_id]));
+      // CHECK_HIP(hipStreamSynchronize(streams[device_id][thread_id]));
       // printf("Pass forward\n");
 
       for (int idx = 0; idx < current_batch_size; idx++) {
@@ -247,7 +248,7 @@ void* test_worker(void* args) {
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
           // You don't need to print every tokens are generated.
           // {
-          safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
+          // safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
           fflush(stdout);
           // }
           // gen_str += piece;
@@ -261,7 +262,7 @@ void* test_worker(void* args) {
       // this timer is not important
       if (start == 0) { start = time_in_ms(); }
     }
-    printf("\n");
+    // printf("\n");
 
     for (int idx = 0; idx < current_batch_size; idx++) {
       gen_str[idx] += "\n";

@@ -185,30 +185,122 @@ void softmax(float* x, int size) {
     x[i] /= sum;
   }
 }
-
 __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
 
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int d_i = blockIdx.x;
+  int batch_i = blockIdx.y;
   float val = 0.0f;
 
+  // #pragma unroll
   for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
-    val += w[d_i * n + idx] * x[idx];
+    val += w[d_i * n + idx] * x[n * batch_i + idx];
   }
   val = blockReduceSum(val);
 
   if (threadIdx.x == 0) {
-    xout[d_i] = val;
+    xout[batch_i * d + d_i] = val;
   }
 }
 
 void gpu_matmul(float* xout, float* x, float* w, int n, int d, int batch_size, hipStream_t *stream) {
-  for (int idx = 0; idx < batch_size; idx++)
-    matmul_kernel<<<d, 512, 0, *stream>>>(xout + idx * d, x + idx * n, w, n, d);
+  // for (int idx = 0; idx < batch_size; idx++)
+  dim3 grid(d, batch_size);
+  // printf("batch_size: %d\n", batch_size);
+  matmul_kernel<<<grid, 1024, 0, *stream>>>(xout, x, w, n, d);
     // CHECK_HIP(hipGetLastError());
 }
+// __global__ void mat_vec_kernel(float* xout, const float* x, const float* w, int n, int d, int numSerialLoads,
+//     int ip_stride, int w_stride, int op_stride, int w_row_stride) {
+
+    
+//     int index = blockIdx.x * blockDim.y + threadIdx.y;
+//     if (index >= d)
+//         return;
+//     const float* __restrict__ input = x + blockIdx.y * ip_stride;
+//     const float* __restrict__ weight = w + blockIdx.y * w_stride;
+//     float* output = xout + blockIdx.y * op_stride;
+
+//     float sum = 0;
+
+//     for (int i = 0; i < numSerialLoads; i++) {
+//         int j = (i * 64 + threadIdx.x) * 8;
+//         if (j < n) {
+//             // float w[8];
+//             // float ip[8];
+//             const float* w = &weight[index * n + j];
+//             const float* ip = &input[j];
+//             for (int el = 0; el < 8; el++)
+//                 sum += float(w[el]) * float(ip[el]);
+//         }
+//     }
+
+//     sum = warpReduceSum(sum);
+
+//     if (threadIdx.x == 0)
+//         output[index] = sum;
+// }
+
+// void gpu_matmul(float* xout, float* x, float* w, int n, int d, int batch, hipStream_t *stream) {
+//     if ((n & 7) || (d & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
+//     int w_row_stride = -1;
+//     int serialElements = divUp(n, 64);
+//     int serialLoads = divUp(serialElements, 8);     // we load 8 elements in parallel
+//     dim3 block_dim(64, 4);
+//     dim3 grid_dim(divUp(d, 4), batch);
+//     if (w_row_stride == -1) w_row_stride = n;
+//     // printf("grid_dim: %d, %d\n", grid_dim.x, grid_dim.y);
+//     // printf("block_dim: %d, %d\n", block_dim.x, block_dim.y);
+//     mat_vec_kernel <<<grid_dim, block_dim, 0, *stream >>> (xout, x, w, n, d, serialLoads, 0, 0, 0, w_row_stride);
+// }
+
+// __global__ void mat_vec_kernel_batch(float* output, float* input, float* weight, int n, int d, int numSerialElements, int batchSize) {
+//   int batchIndex = blockIdx.x / d;
+//   int index = blockIdx.x % d;
+
+//   if (index >= d)
+//     return;
+
+//   float sum = 0;
+//   for (int i = 0; i < numSerialElements; i++) {
+//     int j = i * 64 + threadIdx.x;
+//     if (j < n)
+//       sum += ((float)weight[batchIndex * d * n + index * n + j]) * ((float)input[batchIndex * n + j]);
+//   }
+
+//   sum = warpReduceSum(sum);
+
+//   if (threadIdx.x == 0)
+//     output[batchIndex * d + index] = sum;
+// }
+
+// void gpu_matmul(float* xout, float* x, float* w, int n, int d,  int batchSize, hipStream_t *stream) {
+//   int serialElements = divUp(n, 64);
+//   dim3 block_dim(64, 4);
+//   int blocks = divUp(d, 4) * batchSize;
+//   mat_vec_kernel_batch <<<blocks, block_dim, 0, *stream >>> (xout, x, w, n, d, serialElements, batchSize);
+// }
+
+// __global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+
+//   // W (d,n) @ x (n,) -> xout (d,)
+//   // by far the most amount of time is spent inside this little function
+//   int i = blockIdx.x * blockDim.x + threadIdx.x;
+//   int d_i = blockIdx.x;
+//   float val = 0.0f;
+
+//   for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+//     val += w[d_i * n + idx] * x[idx];
+//   }
+//   val = blockReduceSum(val);
+
+//   if (threadIdx.x == 0) {
+//     xout[d_i] = val;
+//   }
+// }
+
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
@@ -235,6 +327,8 @@ __global__ void RoPE_kernel(int pos, float* sq, float* sk,
   float fcr = cosf(val);
   float fci = sinf(val);
   int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+
+  // #pragma unroll
   for (int v = 0; v < rotn; v++) {
     float* vec = v == 0 ? sq : sk; // the vector to rotate (query or key)
     float v0 = vec[i];
@@ -289,6 +383,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
         const float* k = key_cache + loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
+        #pragma unroll 
         for (int i = 0; i < head_size; i++)
             score += q[i] * k[i];
         score /= sqrtf(head_size);
@@ -304,6 +399,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // weighted sum of the values, store back into xb
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
+        #pragma unroll 16
         for (int t = 0; t < seq_len; t++)
             // val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
             val += att[t] * value_cache[loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size + i];

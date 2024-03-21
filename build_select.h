@@ -6,6 +6,7 @@
 #define MAX_REQ 3
 int BATCH_SIZE = 1;
 
+
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
   do {                                                                                   \

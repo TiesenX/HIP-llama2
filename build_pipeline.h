@@ -4,10 +4,10 @@
 #define MAX_GPU 4
 
 // for streaming
-#define MAX_THREAD 2
+#define MAX_THREAD 6
 
 // for selective batching
-int BATCH_SIZE = 2;
+int BATCH_SIZE = 1;
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -77,7 +77,7 @@ typedef struct {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   TransformerWeights weights_gpu[MAX_GPU]; // the weights of the model
-  RunState state[MAX_GPU]; // buffers for the "wave" of activations in the forward pass
+  RunState state[MAX_GPU][MAX_THREAD]; // buffers for the "wave" of activations in the forward pass
   // some more state needed to properly clean up the memory mapping (sigh)
   int fd; // file descriptor for memory mapping
   float* data; // memory mapped data pointer
@@ -426,13 +426,14 @@ void read_checkpoint(char* checkpoint, Transformer* t) {
 
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int device = 0; device < NUM_GPU; device++) {
         // init and copy weights to GPUs
         init_weights_gpu(weights, &t->weights_gpu[device], config, shared_weights, weights_size, device);
 
         // allocate the RunState buffers
-        malloc_run_state(&t->state[device], &t->config, device);
+        for (int thread = 0; thread < MAX_THREAD; thread++)
+          malloc_run_state(&t->state[device][thread], &t->config, device);
     }
 
 #elif KERNEL_TEST
@@ -477,7 +478,8 @@ void free_transformer(Transformer* t) {
     for (int i=0; i<NUM_GPU; i++) {
         CHECK_HIP(hipSetDevice(i));
         CHECK_HIP(hipFree(t->weights_gpu[i].token_embedding_table));
-        free_run_state(&t->state[i]);
+        for (int thread=0; thread<MAX_THREAD; thread++)
+          free_run_state(&t->state[i][thread]);
     }
 }
 

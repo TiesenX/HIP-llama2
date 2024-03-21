@@ -109,7 +109,7 @@ __global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size) {
     }
 }
 void gpu_rmsnorm(float* o, float* x, float* weight, int size, int batch_size, hipStream_t& stream) {
-  #pragma omp parallel for
+  // #pragma omp parallel for
   for (int idx = 0; idx < batch_size; idx++)
     rmsnorm_kernel <<<1, num_threads_lrg , 0, stream>>> (o + idx * size, x + idx * size, weight, size);
 }
@@ -117,6 +117,7 @@ void gpu_rmsnorm(float* o, float* x, float* weight, int size, int batch_size, hi
 void rmsnorm(float* o, float* x, float* weight, int size) {
   // calculate sum of squares
   float ss = 0.0f;
+
   for (int j = 0; j < size; j++) {
     ss += x[j] * x[j];
   }
@@ -124,6 +125,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
   ss += 1e-5f;
   ss = 1.0f / sqrtf(ss);
   // normalize and scale
+
   for (int j = 0; j < size; j++) {
     o[j] = weight[j] * (ss * x[j]);
   }
@@ -135,6 +137,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 
     // find max value (for numerical stability)
     float max_val = tid < size ? x[tid] : 0;
+    // #pragma unroll
     for (int i = tid + step; i < size; i += step) {
         if (x[i] > max_val) {
             max_val = x[i];
@@ -150,6 +153,7 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
 
     // exp and sum
     float sum = 0.0f;
+    // #pragma unroll
     for (int i = tid; i < size; i += step) {
         x[i] = expf(x[i] - max_val);
         sum += x[i];
@@ -234,9 +238,111 @@ void gpu_matmul(float* xout, float* x, float* w, int n, int d, int batch_size, h
   // for (int idx = 0; idx < batch_size; idx++)
   dim3 grid(d, batch_size);
   // printf("batch_size: %d\n", batch_size);
-  matmul_kernel<<<grid, 512, 0, stream>>>(xout, x, w, n, d);
+  matmul_kernel<<<grid, 1024, 0, stream>>>(xout, x, w, n, d);
     // CHECK_HIP(hipGetLastError());
 }
+
+
+// In 2d block(threads, batch), reduce sum in each batch
+// __device__ float blockReduceMultipleSum(float val)
+// {
+//     static __shared__ float shared[WARP_SIZE]; // Each warp write its sum reduction at here (AMD only have max 16 warp but I allocated more for convenience)
+
+//     int blockId = threadIdx.y * blockDim.x + threadIdx.x; // block index in 2d block
+//     int blockSize = blockDim.x * blockDim.y * blockDim.z;
+//     int lane = blockId % WARP_SIZE;
+//     int wid = blockId / WARP_SIZE;
+//     int batch = threadIdx.y;
+//     int batchNumber = blockDim.y;
+//     int warpNumber = (blockSize + WARP_SIZE - 1) / WARP_SIZE;
+//     int warpEachBatch = (warpNumber + batchNumber - 1) / batchNumber;
+
+//     val = warpReduceSum(val); // Each warp perform sum reduction
+
+//     if (lane == 0)
+//         shared[wid] = val; // First thread in each warp write warp sum to shared mem
+//     __syncthreads();
+
+//     float batchReduction = 0.0f;
+//     for (int w = 0; w < warpEachBatch; w++)
+//     {
+//         int warpInBatch = batch * warpEachBatch + w;
+//         if (warpInBatch < warpNumber)
+//             batchReduction += shared[warpInBatch];
+//     }
+
+//     // return results[batch];
+//     return batchReduction;
+// }
+
+// __global__ void matmulGPU(float *xout, float *x, float *w, int N, int D)
+// {
+//     int tid = threadIdx.x;
+//     int batch = threadIdx.y;
+//     int globalD = blockIdx.x;
+//     int threadNumInBlock = blockDim.x;
+
+//     // Move pointer
+//     xout += batch * D;
+//     x += batch * N;
+
+//     float val = 0.0f;
+//     for (int el = tid; el < N; el += threadNumInBlock)
+//     {
+//         val += w[el + globalD * N] * x[el];
+//     }
+
+//     // Return based on batch of this val
+//     val = blockReduceMultipleSum(val); // return reduction result based on batch
+
+//     if (tid == 0) // thread 0 in each batch write result to
+//     {
+//         xout[globalD] = val;
+//     }
+// }
+
+// void gpu_matmul(float *xout, float *x, float *w, int n, int d, int batch_size, hipStream_t& stream)
+// {
+//     // W (d,n) @ x (n,) -> xout (d,)
+//     // by far the most amount of time is spent inside this little function
+
+//     dim3 threadBlock(128, batch_size);
+//     dim3 gridSize(d);
+//     matmulGPU<<<dim3(gridSize),dim3(threadBlock), 0, stream>>>(xout, x, w, n, d);
+//     CHECK_HIP(hipGetLastError());
+// }
+// __global__ void matvecGPU(float *xout, float *x, float *w, int n, int d)
+// {
+//     int tid = threadIdx.x;
+//     int globalD = blockIdx.x;
+//     int blockSize = blockDim.x;
+
+//     float val = 0.0f;
+
+// #pragma unroll
+//     for (int el = tid; el < n; el += blockSize)
+//     {
+//         val += w[globalD * n + el] * x[el];
+//     }
+
+//     val = blockReduceSum(val);
+
+//     if (tid == 0)
+//     {
+//         xout[globalD] = val;
+//     }
+// }
+
+// void matmul_vec(float *xout, float *x, float *w, int n, int d)
+// {
+//     // W (d,n) @ x (n,) -> xout (d,)
+//     // by far the most amount of time is spent inside this little function
+
+//     dim3 threadBlock(1024);
+//     dim3 gridSize(d);
+//     matvecGPU<<<dim3(gridSize), dim3(threadBlock), 0, 0>>>(xout, x, w, n, d);
+//     CHECK_HIP(hipGetLastError());
+// }
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
@@ -275,7 +381,7 @@ void gpu_RoPE(float* sq, float* sk, int pos, int dim, int head_size, int kv_dim,
   dim3 block(64);
   dim3 grid(((dim + 1) / 2 + block.x - 1) / block.x);
 
-  #pragma omp parallel for
+  // #pragma omp parallel for
   for (int idx = 0; idx < batch_size; idx++)
     RoPE_kernel<<<grid, block, 0, stream>>>(pos, sq + idx * dim, sk + idx * dim, dim, kv_dim, head_size);
   // CHECK_HIP(hipGetLastError());
@@ -318,8 +424,11 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
         const float* k = key_cache + loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size;
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
+
+        #pragma unroll 
         for (int i = 0; i < head_size; i++)
             score += q[i] * k[i];
+
         score /= sqrtf(head_size);
         // save the score to the attention buffer
         att[t] = score;
@@ -333,6 +442,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
     // weighted sum of the values, store back into xb
     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
         float val = 0.0f;
+        #pragma unroll 16 
         for (int t = 0; t < seq_len; t++)
             // val += att[t] * value_cache[loff + t * kv_dim + (h / kv_mul) * head_size + i];
             val += att[t] * value_cache[loff + t * batch_size * kv_dim + batch * kv_dim + (h / kv_mul) * head_size + i];
@@ -400,7 +510,7 @@ __global__ void swiglu_kernel(float *shb, float *shb2, int hidden_dim) {
     }
 }
 void gpu_swiglu(float *shb, float *shb2, int hidden_dim, int batch_size, hipStream_t& stream) {
-  #pragma omp parallel for
+  // #pragma omp parallel for
   for (int idx = 0; idx < batch_size; idx++)
     swiglu_kernel<<<divUp(hidden_dim, num_threads_med), num_threads_med, 0, stream>>>(shb + idx * hidden_dim, shb2 + idx * hidden_dim, hidden_dim);
 }
@@ -423,7 +533,7 @@ __global__ void accum_kernel(float* a, float* b, int size) {
   }
 }
 void gpu_accum(float *a, float *b, int size, int batch_size, hipStream_t& stream) {
-  #pragma omp parallel for
+  // #pragma omp parallel for
   for (int idx = 0; idx < batch_size; idx++)
     accum_kernel<<<divUp(size, num_threads_med), num_threads_med, 0, stream>>>(a + idx * size, b + idx * size, size);
 }
