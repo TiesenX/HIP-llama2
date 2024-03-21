@@ -4,10 +4,10 @@
 #define MAX_GPU 4
 
 // for streaming
-#define MAX_THREAD 2
+#define MAX_THREAD 1
 
 // for selective batching
-int BATCH_SIZE = 2;
+int BATCH_SIZE = 1;
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \

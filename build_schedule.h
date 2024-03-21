@@ -4,7 +4,7 @@
 #define MAX_GPU 4
 
 #define MAX_REQ 1
-int BATCH_SIZE = 6;
+#define BATCH_SIZE 6
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -62,7 +62,6 @@ typedef struct {
   float *v; // value (dim,)
   float *att; // buffer for scores/attention values (n_heads, seq_len)
   float *logits; // output logits
-  float *logits_gpu; // output logits
   
   // kv cache
   float* key_cache;   // (layer, seq_len, dim)
@@ -76,8 +75,8 @@ typedef struct {
 typedef struct {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
-  TransformerWeights weights_gpu; // the weights of the model
-  RunState state; // buffers for the "wave" of activations in the forward pass
+  TransformerWeights weights_gpu[MAX_GPU]; // the weights of the model
+  RunState state[MAX_GPU]; // buffers for the "wave" of activations in the forward pass
   // some more state needed to properly clean up the memory mapping (sigh)
   int fd; // file descriptor for memory mapping
   float* data; // memory mapped data pointer
@@ -145,20 +144,18 @@ void malloc_run_state(RunState* s, Config* p) {
     CHECK_HIP(hipMalloc((void**)&s->hb, p->hidden_dim * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->hb2, p->hidden_dim * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->q, p->dim * BATCH_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->k, kv_dim * BATCH_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->v, kv_dim * BATCH_SIZE * sizeof(float)));
 
     // need adjustment
     CHECK_HIP(hipMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
     CHECK_HIP(hipMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * kv_dim * BATCH_SIZE  * sizeof(float)));
 
-    CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * BATCH_SIZE * sizeof(float)));
-    CHECK_HIP(hipMalloc((void**)&s->logits_gpu, p->vocab_size * BATCH_SIZE * sizeof(float)));
+    // CHECK_HIP(hipMalloc((void**)&s->att, p->n_heads * p->seq_len * BATCH_SIZE * sizeof(float)));
     CHECK_HIP(hipHostMalloc((void**)&s->logits, p->vocab_size * BATCH_SIZE * sizeof(float), hipMemAllocationTypePinned));
-    // s->logits = (float *)calloc(p->vocab_size, sizeof(float));
+
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
+     || !s->key_cache || !s->value_cache || !s->logits) {
+    //  || !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu || !s->logits) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -171,8 +168,7 @@ void free_run_state(RunState* s) {
     CHECK_HIP(hipFree(s->hb));
     CHECK_HIP(hipFree(s->hb2));
     CHECK_HIP(hipFree(s->q));
-    CHECK_HIP(hipFree(s->att));
-    CHECK_HIP(hipFree(s->logits_gpu));
+    // CHECK_HIP(hipFree(s->att));
     CHECK_HIP(hipHostFree(s->logits));    
     CHECK_HIP(hipFree(s->key_cache));
     CHECK_HIP(hipFree(s->value_cache));
@@ -321,8 +317,8 @@ void read_checkpoint(char* checkpoint, Transformer* t) {
         // allocate the RunState buffers
         // for (int thread = 0; thread < MAX_REQ; thread++)
             // malloc_run_state(&t->state[device][thread], &t->config);
-        memory_map_weights(&t->weights_gpu, config, weights_ptr[device], shared_weights);
-        malloc_run_state(&t->state, &t->config);
+        memory_map_weights(&t->weights_gpu[device], config, weights_ptr[device], shared_weights);
+        malloc_run_state(&t->state[device], &t->config);
     }
 
 #elif KERNEL_TEST
@@ -370,7 +366,7 @@ void free_transformer(Transformer* t) {
         // for (int j=0; j<MAX_REQ; j++) {
         //   free_run_state(&t->state[i][j]);
         // }
-        free_run_state(&t->state);
+        free_run_state(&t->state[i]);
     }
 }
 
