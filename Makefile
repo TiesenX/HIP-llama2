@@ -15,9 +15,13 @@ rungpu: run.cc
 runselect: run_select.cc
 	$(CC) -DUSE_GPU -o runselect run_select.cc -O2 --offload-arch=gfx908 -fopenmp
 
-.PHONY: runschedule
-runschedule: run_schedule.cc
-	$(CC) -DUSE_GPU -o runschedule run_schedule.cc -O2 --offload-arch=gfx908 -fopenmp
+.PHONY: runschedule_4B
+runschedule_4B: run_schedule_4B.cc
+	$(CC) -DUSE_GPU -o runschedule_4B run_schedule_4B.cc -O3 --offload-arch=gfx908 -fopenmp
+
+.PHONY: runschedule_7B
+runschedule_7B: run_schedule_7B.cc
+	$(CC) -DUSE_GPU -o runschedule_7B run_schedule_7B.cc -O3 --offload-arch=gfx908 -fopenmp
 
 .PHONY: run13B
 run13B: run_13B.cc
@@ -29,4 +33,4 @@ test: testing.cc run.cc
 
 .PHONY: clean
 clean:
-	rm -f runcc testcc run13B *.csv *.db output_test*.txt *.json result*.txt   
+	rm -f runcc testcc run13B runschedule_7B runschedule_4B *.csv *.db output_test*.txt *.json result*.txt   

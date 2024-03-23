@@ -1,5 +1,5 @@
 #pragma once
-#include "build_schedule.h"
+#include "build_schedule_7B.h"
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -18,6 +18,7 @@
 
 __inline__ __device__
 float warpReduceSum(float val) {
+  #pragma unroll
   for (int offset = warpSize/2; offset > 0; offset >>= 1) 
     val += __shfl_down(val, offset);
   return val;
@@ -136,6 +137,7 @@ __device__ float blockReduceMultipleSum(float val)
     __syncthreads();
 
     float batchReduction = 0.0f;
+    #pragma unroll
     for (int w = 0; w < warpEachBatch; w++)
     {
         int warpInBatch = batch * warpEachBatch + w;
@@ -182,6 +184,43 @@ void gpu_matmul(float *xout, float *x, float *w, int N, int D, int batch_size)
     dim3 gridSize(D);
     matmulGPU<<<gridSize, threadBlock>>>(xout, x, w, N, D);
     CHECK_HIP(hipGetLastError());
+}
+
+__global__ void matmulGPU2(float *xout, float *x, float *w, int N, int D, int batch_size)
+{
+    int tid = threadIdx.x;
+    int globalD = blockIdx.x;
+    int threadNumInBlock = blockDim.x;
+
+
+    float val[BATCH_SIZE] = {0.0f};
+    for (int el = tid; el < N; el += threadNumInBlock)
+    {
+      float weight = w[el + globalD * N];
+      for (int b = 0; b < batch_size; b++)
+        val[b] += weight * x[el + b * N];
+    }
+
+    // Return based on batch of this val
+    for (int b = 0; b < batch_size; b++){
+      val[b] = blockReduceSum(val[b]); // return reduction result based on batch
+
+      if (tid == 0) // thread 0 in each batch write result to
+      {
+          xout[globalD + b * D] = val[b];
+      }
+    }
+}
+
+void gpu_matmul2(float *xout, float *x, float *w, int N, int D, int batch_size)
+{
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+
+    dim3 threadBlock(512);
+    dim3 gridSize(D);
+
+    matmulGPU2<<<gridSize, threadBlock>>>(xout, x, w, N, D, batch_size);
 }
 
 __global__ void mat_vec(float *xout, float *x, float *w, int n, int d) {
@@ -457,6 +496,7 @@ __global__ void MultiHeadAttention_kernel(float* __restrict__ output, const floa
         // calculate the attention score as the dot product of q and k
         float score = 0.0f;
 
+        #pragma unroll
         for (int i = 0; i < head_size; i++)
             score += q[i] * k[i];
         score /= sqrtf(head_size);

@@ -3,7 +3,7 @@
 #define USE_GPU 1
 #define MAX_GPU 4
 
-#define BATCH_SIZE 3
+#define BATCH_SIZE 6
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -129,7 +129,7 @@ typedef struct {
   int *next_req;
 } thread_args;
 
-#include "kernels_schedule.h"
+#include "kernels_schedule_4B.h"
 int NUM_GPU = 1;
 #ifdef USE_GPU
 void malloc_run_state(RunState* s, Config* p) {

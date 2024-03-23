@@ -34,10 +34,8 @@
 
 // ----------------------------------------------------------------------------
 // Forward inference
-pthread_mutex_t mutex[MAX_GPU] = {PTHREAD_MUTEX_INITIALIZER};
-int next_thread[MAX_GPU] = {0};
 
-void forward(float* logits, Transformer* transformer, int* token, int pos, int batch_size, int thread_id) {
+float* forward(Transformer* transformer, int* token, int pos, int batch_size, int thread_id) {
 
   // a few convenience variables
   Config* p = &transformer->config;
@@ -52,166 +50,109 @@ void forward(float* logits, Transformer* transformer, int* token, int pos, int b
   for (int device_id = 0; device_id < NUM_GPU; device_id++) {
     CHECK_HIP(hipSetDevice(device_id));
     w[device_id] = &transformer->weights_gpu[device_id];
-    s[device_id] = &transformer->state[device_id];
+    s[device_id] = &transformer->state[device_id][thread_id];
   }
 
+  CHECK_HIP(hipSetDevice(0));
   float *x[NUM_GPU];
-  float *x_tmp;
-  CHECK_HIP(hipHostMalloc((void**)&x_tmp, dim * batch_size * sizeof(float), hipMemAllocationTypePinned));
+  x[0] = s[0]->x;
 
-  while(true) {
-    // If this thread of GPU 0 can run
-    if (thread_id == next_thread[0]) {
-      pthread_mutex_lock(&mutex[0]);
-      int device_id = 0;
-      CHECK_HIP(hipSetDevice(device_id));
-      x[device_id] = logits;
+  if (thread_id > 0) {
+    CHECK_HIP(hipStreamWaitEvent(streams[0], events[thread_id-1][0], 0));
+    CHECK_HIP(hipEventSynchronize(events[thread_id-1][0]));
+  }
+  // copy the token embedding into x
+  for (int idx = 0; idx < batch_size; idx++) {
+    float* content_row = w[0]->token_embedding_table + token[idx] * dim;
+    CHECK_HIP(hipMemcpyAsync(x[0] + idx * dim, content_row, dim*sizeof(*(x[0])), hipMemcpyDeviceToDevice, streams[0]));
+    CHECK_HIP(hipStreamSynchronize(streams[0]));
+  }
 
-      // copy the token embedding into x
+  CHECK_HIP(hipDeviceSynchronize());
+
+  for (int device_id = 0; device_id < NUM_GPU; device_id++) {
+    CHECK_HIP(hipSetDevice(device_id));
+
+    if (device_id > 0) {
+      CHECK_HIP(hipStreamWaitEvent(streams[device_id], events[thread_id][device_id-1], 0));
+    }
+    if (thread_id > 0) {
+      CHECK_HIP(hipStreamWaitEvent(streams[device_id], events[thread_id-1][device_id], 0));
+      CHECK_HIP(hipEventSynchronize(events[thread_id-1][device_id]));
+    }
+
+    x[device_id] = s[device_id]->x;
+
+    // forward all the layers
+    int num_layers = layer_end[device_id] - layer_begin[device_id];
+    for(int l = 0; l < num_layers; l++) {
+      
+      // attention rmsnorm
+      gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_att_weight + l*dim, dim, batch_size, streams[device_id]);
+
+      // save key,value at this time step (pos) to our kv cache
+      int loff = (layer_begin[device_id] + l) * p->seq_len * kv_dim * batch_size;
+      s[device_id]->k = s[device_id]->key_cache + loff + pos * kv_dim * batch_size;
+      s[device_id]->v = s[device_id]->value_cache + loff + pos * kv_dim * batch_size;
+
+      // qkv matmuls for this position
+      gpu_matmul(s[device_id]->q, s[device_id]->xb, w[device_id]->wq + l*dim*dim, dim, dim, batch_size, streams[device_id]);
+      gpu_matmul(s[device_id]->k, s[device_id]->xb, w[device_id]->wk + l*dim*kv_dim, dim, kv_dim, batch_size, streams[device_id]);
+      gpu_matmul(s[device_id]->v, s[device_id]->xb, w[device_id]->wv + l*dim*kv_dim, dim, kv_dim, batch_size, streams[device_id]);
+
+      gpu_RoPE(s[device_id]->q, s[device_id]->k, pos, dim, head_size, kv_dim, batch_size, streams[device_id]);
+      
       for (int idx = 0; idx < batch_size; idx++) {
-        float* content_row = w[device_id]->token_embedding_table + token[idx] * dim;
-        CHECK_HIP(hipMemcpy(x[device_id] + idx * dim, content_row, dim*sizeof(*(x[device_id])), hipMemcpyDeviceToDevice));
+        gpu_MultiHeadAttention(s[device_id]->xb + idx * dim, 
+                               s[device_id]->q + idx * dim, 
+                               s[device_id]->key_cache, s[device_id]->value_cache, 
+                               kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, batch_size, streams[device_id]);
       }
       
-// forward all the layers
-      int num_layers = layer_end[device_id] - layer_begin[device_id];
-      for(int l = 0; l < num_layers; l++) {
-        
-        // attention rmsnorm
-        gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_att_weight + l*dim, dim, batch_size);
-        // save key,value at this time step (pos) to our kv cache
-        int loff = (layer_begin[device_id] + l) * p->seq_len * kv_dim * batch_size;
-        s[device_id]->k = s[device_id]->key_cache + loff + pos * kv_dim * batch_size;
-        s[device_id]->v = s[device_id]->value_cache + loff + pos * kv_dim * batch_size;
-        
-        // qkv matmuls for this position
-        gpu_matmul(s[device_id]->q, s[device_id]->xb, w[device_id]->wq + l*dim*dim, dim, dim, batch_size);
-        gpu_matmul(s[device_id]->k, s[device_id]->xb, w[device_id]->wk + l*dim*kv_dim, dim, kv_dim, batch_size);
-        gpu_matmul(s[device_id]->v, s[device_id]->xb, w[device_id]->wv + l*dim*kv_dim, dim, kv_dim, batch_size);
+      // final matmul to get the output of the attention
+      gpu_matmul(s[device_id]->xb2, s[device_id]->xb, w[device_id]->wo + l*dim*dim, dim, dim, batch_size, streams[device_id]);
 
-        gpu_RoPE(s[device_id]->q, s[device_id]->k, pos, dim, head_size, kv_dim, batch_size);
-        
-        for (int idx = 0; idx < batch_size; idx++) {
-          gpu_MultiHeadAttention(s[device_id]->xb + idx * dim, 
-                                s[device_id]->q + idx * dim, 
-                                s[device_id]->key_cache, s[device_id]->value_cache, 
-                                kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, batch_size);
-        }
+      // residual connection back into x
+      gpu_accum(x[device_id], s[device_id]->xb2, dim, batch_size, streams[device_id]);
+
+      // ffn rmsnorm
+      gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_ffn_weight + l*dim, dim, batch_size, streams[device_id]);
+
+      // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
+      // first calculate self.w1(x) and self.w3(x)
+      gpu_matmul(s[device_id]->hb, s[device_id]->xb, w[device_id]->w1 + l*dim*hidden_dim, dim, hidden_dim, batch_size, streams[device_id]);
+      gpu_matmul(s[device_id]->hb2, s[device_id]->xb, w[device_id]->w3 + l*dim*hidden_dim, dim, hidden_dim, batch_size, streams[device_id]);
+
+      // SwiGLU non-linearity
+      gpu_swiglu(s[device_id]->hb, s[device_id]->hb2, hidden_dim, batch_size, streams[device_id]);
+
+      // final matmul to get the output of the ffn
+      gpu_matmul(s[device_id]->xb, s[device_id]->hb, w[device_id]->w2 + l*dim*hidden_dim, hidden_dim, dim, batch_size, streams[device_id]);
+
+      // residual connection
+      gpu_accum(x[device_id], s[device_id]->xb, dim, batch_size, streams[device_id]);
+    }
+
+    if (device_id < NUM_GPU - 1) {
+      CHECK_HIP(hipMemcpyAsync(s[device_id + 1]->x, s[device_id]->x, 
+                          dim * batch_size * sizeof(float), hipMemcpyDeviceToDevice, streams[device_id]));
+      CHECK_HIP(hipStreamSynchronize(streams[device_id]));
+      CHECK_HIP(hipEventRecord(events[thread_id][device_id], streams[device_id]));
+    }
+    else {
+      // final rmsnorm
+      gpu_rmsnorm(x[device_id], x[device_id], w[device_id]->rms_final_weight, dim, batch_size, streams[device_id]);
+
+      // classifier into logits
+      gpu_matmul(s[device_id]->logits_gpu, x[device_id], w[device_id]->wcls, p->dim, p->vocab_size, batch_size, streams[device_id]);
       
-        // final matmul to get the output of the attention
-        gpu_matmul(s[device_id]->xb2, s[device_id]->xb, w[device_id]->wo + l*dim*dim, dim, dim, batch_size);
-
-        // residual connection back into x
-        gpu_accum(x[device_id], s[device_id]->xb2, dim, batch_size);
-
-        // ffn rmsnorm
-        gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_ffn_weight + l*dim, dim, batch_size);
-
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // first calculate self.w1(x) and self.w3(x)
-        gpu_matmul(s[device_id]->hb, s[device_id]->xb, w[device_id]->w1 + l*dim*hidden_dim, dim, hidden_dim, batch_size);
-        gpu_matmul(s[device_id]->hb2, s[device_id]->xb, w[device_id]->w3 + l*dim*hidden_dim, dim, hidden_dim, batch_size);
-
-        // SwiGLU non-linearity
-        gpu_swiglu(s[device_id]->hb, s[device_id]->hb2, hidden_dim, batch_size);
-
-        // final matmul to get the output of the ffn
-        gpu_matmul(s[device_id]->xb, s[device_id]->hb, w[device_id]->w2 + l*dim*hidden_dim, hidden_dim, dim, batch_size);
-
-        // residual connection
-        gpu_accum(x[device_id], s[device_id]->xb, dim, batch_size);
-      }
-      CHECK_HIP(hipMemcpy(x_tmp, s[device_id]->x, 
-                          dim * batch_size * sizeof(float), hipMemcpyDeviceToDevice));
-      
-      CHECK_HIP(hipDeviceSynchronize());
-
-      // GPU 0 in next thread can run
-      next_thread[device_id] = (next_thread[device_id] + 1) % MAX_THREAD;
-      pthread_mutex_unlock(&mutex[device_id]);
-      break;
+      CHECK_HIP(hipMemcpyAsync(s[device_id]->logits, s[device_id]->logits_gpu, p->vocab_size * batch_size * sizeof(float), hipMemcpyDeviceToHost, streams[device_id]));
+      CHECK_HIP(hipStreamSynchronize(streams[device_id]));
+      CHECK_HIP(hipEventRecord(events[thread_id][device_id], streams[device_id]));
+      return s[device_id]->logits;
     }
   }
-
-  for (int device_id = 1; device_id < NUM_GPU; device_id++) {
-    while(true) {
-      if (thread_id == next_thread[device_id]) {
-        pthread_mutex_lock(&mutex[device_id]);
-        CHECK_HIP(hipSetDevice(device_id));
-        CHECK_HIP(hipMemcpy(s[device_id]->x, x_tmp, 
-                            dim * batch_size * sizeof(float), hipMemcpyDeviceToDevice));
-        x[device_id] = s[device_id]->x;
-
-        // forward all the layers
-        int num_layers = layer_end[device_id] - layer_begin[device_id];
-        for(int l = 0; l < num_layers; l++) {
-          
-          // attention rmsnorm
-          gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_att_weight + l*dim, dim, batch_size);
-          // save key,value at this time step (pos) to our kv cache
-          int loff = (layer_begin[device_id] + l) * p->seq_len * kv_dim * batch_size;
-          s[device_id]->k = s[device_id]->key_cache + loff + pos * kv_dim * batch_size;
-          s[device_id]->v = s[device_id]->value_cache + loff + pos * kv_dim * batch_size;
-          
-          // qkv matmuls for this position
-          gpu_matmul(s[device_id]->q, s[device_id]->xb, w[device_id]->wq + l*dim*dim, dim, dim, batch_size);
-          gpu_matmul(s[device_id]->k, s[device_id]->xb, w[device_id]->wk + l*dim*kv_dim, dim, kv_dim, batch_size);
-          gpu_matmul(s[device_id]->v, s[device_id]->xb, w[device_id]->wv + l*dim*kv_dim, dim, kv_dim, batch_size);
-
-          gpu_RoPE(s[device_id]->q, s[device_id]->k, pos, dim, head_size, kv_dim, batch_size);
-          
-          for (int idx = 0; idx < batch_size; idx++) {
-            gpu_MultiHeadAttention(s[device_id]->xb + idx * dim, 
-                                  s[device_id]->q + idx * dim, 
-                                  s[device_id]->key_cache, s[device_id]->value_cache, 
-                                  kv_dim, kv_mul, p->n_heads, head_size, loff, pos+1, idx, batch_size);
-          }
-        
-          // final matmul to get the output of the attention
-          gpu_matmul(s[device_id]->xb2, s[device_id]->xb, w[device_id]->wo + l*dim*dim, dim, dim, batch_size);
-
-          // residual connection back into x
-          gpu_accum(x[device_id], s[device_id]->xb2, dim, batch_size);
-
-          // ffn rmsnorm
-          gpu_rmsnorm(s[device_id]->xb, x[device_id], w[device_id]->rms_ffn_weight + l*dim, dim, batch_size);
-
-          // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-          // first calculate self.w1(x) and self.w3(x)
-          gpu_matmul(s[device_id]->hb, s[device_id]->xb, w[device_id]->w1 + l*dim*hidden_dim, dim, hidden_dim, batch_size);
-          gpu_matmul(s[device_id]->hb2, s[device_id]->xb, w[device_id]->w3 + l*dim*hidden_dim, dim, hidden_dim, batch_size);
-
-          // SwiGLU non-linearity
-          gpu_swiglu(s[device_id]->hb, s[device_id]->hb2, hidden_dim, batch_size);
-
-          // final matmul to get the output of the ffn
-          gpu_matmul(s[device_id]->xb, s[device_id]->hb, w[device_id]->w2 + l*dim*hidden_dim, hidden_dim, dim, batch_size);
-
-          // residual connection
-          gpu_accum(x[device_id], s[device_id]->xb, dim, batch_size);
-        }
-
-        if (device_id < NUM_GPU - 1) {
-          CHECK_HIP(hipMemcpy(x_tmp, s[device_id]->x, 
-                              dim * batch_size * sizeof(float), hipMemcpyDeviceToDevice));
-        }
-        else {
-          // final rmsnorm
-          gpu_rmsnorm(x[device_id], x[device_id], w[device_id]->rms_final_weight, dim, batch_size);
-
-          // classifier into logits
-          gpu_matmul(s[device_id]->logits_gpu, x[device_id], w[device_id]->wcls, p->dim, p->vocab_size, batch_size);
-          CHECK_HIP(hipMemcpy(logits, s[device_id]->logits_gpu, 
-                              p->vocab_size * batch_size * sizeof(float), hipMemcpyDeviceToDevice));
-        }
-        CHECK_HIP(hipDeviceSynchronize());
-
-        next_thread[device_id] = (next_thread[device_id] + 1) % MAX_THREAD;
-        pthread_mutex_unlock(&mutex[device_id]);
-        break;
-      }
-    }
-  }
+  return NULL;
 }
 
 
@@ -219,7 +160,7 @@ void forward(float* logits, Transformer* transformer, int* token, int pos, int b
 // You should parallelize and optimize from this function exploiting multiple GPUs
 //
 
-pthread_mutex_t mutex_req = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 int cnt_threads[MAX_THREAD];
 
 void* test_worker(void* args) {
@@ -233,17 +174,18 @@ void* test_worker(void* args) {
 
   int current_req;
   int gen_cnt = 0;
+  // int total_reqs = BATCH_SIZE * 2;
   int total_reqs = targs->total_reqs;
 
   while(true) {
-    pthread_mutex_lock(&mutex_req);
+    pthread_mutex_lock(&mutex);
     current_req = *next_req;
     int current_batch_size = BATCH_SIZE;
     if (current_req + current_batch_size > total_reqs) {
         current_batch_size = total_reqs - current_req;
     }
     *next_req = *next_req + current_batch_size;
-    pthread_mutex_unlock(&mutex_req);
+    pthread_mutex_unlock(&mutex);
     if (current_req >= total_reqs) {
       break;
     }
@@ -262,6 +204,7 @@ void* test_worker(void* args) {
     bool end_request[current_batch_size];
     int cnt_tokens[current_batch_size];
 
+    // #pragma omp parallel for
     for (int idx = 0; idx < current_batch_size; idx++) {
       end_request[idx] = false;
       cnt_tokens[idx] = 0;
@@ -290,11 +233,10 @@ void* test_worker(void* args) {
 
       // this part for the middle GPUs: continuous forward
       // -------------------------------------------------------------
-      float* logits;
-      CHECK_HIP(hipHostMalloc((void**)&logits, transformer->config.vocab_size * current_batch_size * sizeof(float), hipMemAllocationTypePinned)); 
-      forward(logits, transformer, token, pos, current_batch_size, thread_id);
+      float* logits = forward(transformer, token, pos, current_batch_size, thread_id);
       // printf("Pass forward\n");
       
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         // advance the state machine
         if (pos < num_prompt_tokens[idx] - 1) {
@@ -311,6 +253,7 @@ void* test_worker(void* args) {
 
       // data-dependent terminating condition: the BOS (=1) token delimits sequences
       
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if ((next[idx] == 1 || next[idx] == 2) && !end_request[idx]) {
           end_request[idx] = true;
@@ -328,13 +271,14 @@ void* test_worker(void* args) {
       // print the token as string, decode it with the Tokenizer object
       char* piece[current_batch_size];
       
+      // #pragma omp parallel for
       for (int idx = 0; idx < current_batch_size; idx++) {
         if (!end_request[idx]){
           piece[idx] = decode(tokenizer, token[idx], next[idx]);
           // You don't need to print every tokens are generated.
           // {
-          // safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
-          // fflush(stdout);
+          safe_printf(piece[idx]); // same as printf("%s", piece), but skips "unsafe" bytes
+          fflush(stdout);
           // }
           // gen_str += piece;
           append_str(piece[idx], gen_str[idx]);
@@ -349,6 +293,7 @@ void* test_worker(void* args) {
     }
     printf("\n");
 
+    // #pragma omp parallel for
     for (int idx = 0; idx < current_batch_size; idx++) {
       gen_str[idx] += "\n";
       strcpy(get_str_gen_ptr(requests, current_req + idx), gen_str[idx].c_str());
@@ -369,7 +314,6 @@ void* test_worker(void* args) {
       gen_cnt += sum_tokens;
     }
     printf("End of the request\n");
-    fflush(stdout);
   }
 
   cnt_threads[thread_id] = gen_cnt;
@@ -384,7 +328,6 @@ int test(Transformer *transformer, Tokenizer *tokenizer, Requests * requests, in
   int* next_req = (int*)malloc(sizeof(int));
   
   *next_req = 0; // global request index
-  printf("NUM THREAD: %d\n", MAX_THREAD);
 
   thread_args args[MAX_THREAD];
   pthread_t threads[MAX_THREAD];
@@ -544,14 +487,14 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
-    free_requests(&requests);
+    // free_requests(&requests);
 
   } else {
     fprintf(stderr, "unknown mode: %s\n", mode);
     error_usage();
   }
 
-  destroyStreams();
+  // destroyStreams();
   // // memory and file handles cleanup
   // free_sampler(&sampler);
   // free_tokenizer(&tokenizer);

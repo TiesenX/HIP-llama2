@@ -17,8 +17,10 @@
 #include <omp.h>
 #include <pthread.h>
 #include <math.h>
-#include "build_schedule.h"
-#include "kernels_schedule.h"
+#include "build_schedule_1.h"
+#include "kernels_schedule_1.h"
+
+#include <ctime> // Include the header file for time functions
 
 // Macros for error checking
 #define CHECK_HIP(cmd)                                                                   \
@@ -324,15 +326,6 @@ void* test_in_thread(void *arg) {
     }
     if (new_batch_size == 0) break;
     current_batch_size = new_batch_size;
-
-    // bool stop = true;
-    // for (int idx = 0; idx < current_batch_size; idx++) {
-    //   out_of_length[idx] = false;
-    //   if (req_in_batch[idx] != -1) {
-    //     stop = false;
-    //   }
-    // }
-    // if (stop) break;
   }
 
   cnt_thread[device_id] = gen_cnt;
@@ -399,7 +392,13 @@ void error_usage() {
   exit(EXIT_FAILURE);
 }
 
+#include <sys/time.h>
 
+double get_mtime() {
+  struct timeval tv;
+  gettimeofday(&tv, 0);
+  return tv.tv_sec + tv.tv_usec * 1e-6;
+}
 int main(int argc, char *argv[]) {
   printf("Enter main\n");
   // default parameters
@@ -475,6 +474,54 @@ int main(int argc, char *argv[]) {
       exit(EXIT_FAILURE);
     }
 
+    // double elapsed_time = 0.0;
+    // int batch_size = 2;
+    // int n = transformer.config.dim;
+    // float *xGPU;
+    // float *wGPU;
+    // int d = transformer.config.vocab_size;
+    // float *xoutGPU;
+    // CHECK_HIP(hipMalloc(&xGPU, n * batch_size * sizeof(float)));
+    // CHECK_HIP(hipMalloc(&wGPU, n * d * sizeof(float)));
+    // CHECK_HIP(hipHostMalloc(&xoutGPU, d * batch_size * sizeof(float), hipMemAllocationTypePinned));
+
+    // // ...
+
+    // for (int i = 0; i <= 10; ++i) {
+    //   double start_time = get_mtime();
+    //   gpu_matmul(xoutGPU, xGPU, wGPU, n, d, batch_size);
+    //   CHECK_HIP(hipDeviceSynchronize());
+    //   if (i > 0) {
+    //     elapsed_time += get_mtime() - start_time; // Calculate the elapsed time
+    //   }
+    // }
+    // printf("%f sec, GFLOPS: %f \n", elapsed_time, 2 * n * d * batch_size / (elapsed_time / 10) / 1e9);
+    // fflush(stdout);
+
+    // float *xoutGPU2;
+    // CHECK_HIP(hipHostMalloc(&xoutGPU2, d * batch_size * sizeof(float), hipMemAllocationTypePinned));
+
+    // // ...
+
+    // for (int i = 0; i <= 10; ++i) {
+    //   double start_time = get_mtime();
+    //   gpu_matmul2(xoutGPU2, xGPU, wGPU, n, d, batch_size);
+    //   CHECK_HIP(hipDeviceSynchronize());
+    //   if (i > 0) {
+    //     elapsed_time += get_mtime() - start_time; // Calculate the elapsed time
+    //   }
+    // }
+    // printf("%f sec, GFLOPS: %f \n", elapsed_time, 2 * n * d * batch_size / (elapsed_time / 10) / 1e9);
+    // fflush(stdout);
+
+    // for (int i =0; i < d*batch_size; i++){
+    //   if (xoutGPU[i] - xoutGPU2[i] > 1e-3){
+    //     printf("Error at %d\n", i);
+    //     break;
+    //   }
+    // }
+    // // ...
+
     init_prompt_state(&requests, &tokenizer);
     init_streams();
     Sampler samplers[requests.num_reqs];
@@ -492,7 +539,6 @@ int main(int argc, char *argv[]) {
 
     // Your goal is to achieve best throughput(=reduce elapsed time)! 
     fprintf(stdout, "elapsed time(s): %f, achieved throughput(tok/s): %f\n", (double)(end-start)/1000, (num_gen_tokens) / (double)(end-start)*1000);
-    //}
 
     if(EXIT_FAILURE == write_outputfile(output_filename, &requests)) {
       fprintf(stderr, "cannot write output file: %s\n", input_filename);
